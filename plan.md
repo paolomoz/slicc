@@ -2,7 +2,7 @@
 
 ## Summary
 
-Sprinkles are UI-driven action builders attached to scoops. Instead of firing individual licks per button click, sprinkle buttons **accumulate actions client-side**, then a dedicated fast model (Haiku) summarizes them into a single natural language prompt sent as one lick to the scoop.
+Sprinkles are UI-driven action builders attached to scoops. Instead of firing individual licks per button click, sprinkle buttons **accumulate actions client-side**, then an LLM summarizes them into a single natural language prompt sent as one lick to the scoop.
 
 **Ice cream metaphor**: Sprinkles are the toppings you pick before the scoop is served. You choose what you want, then it all gets applied at once.
 
@@ -12,50 +12,65 @@ Sprinkles are UI-driven action builders attached to scoops. Instead of firing in
 
 | Decision | Choice |
 |----------|--------|
-| Definition format | SPRINKLE.md (YAML frontmatter + markdown body) |
-| UI surface | Auto-select: inline (≤3 actions) or floating panel (4+) |
-| Prompt generation | Dedicated fast model (Haiku) for client-side LLM summary |
+| Definition format | SPRINKLE.md (JSON frontmatter + markdown body) — no YAML dependency |
+| UI surface | Auto-select: inline (≤3 visible actions) or floating panel (4+) |
+| Prompt generation | LLM summary: Haiku when Anthropic-compatible key available, otherwise scoop's own model |
 | Scope | Scoop-specific |
 | Storage | `/workspace/skills/{skill-name}/SPRINKLE.md` alongside SKILL.md |
+| Conditional actions | V1 — actions can show/hide based on other action values |
 
 ---
 
 ## SPRINKLE.md Format
 
-```yaml
----
-name: code-review
-description: Review code changes with configurable focus
-actions:
-  - id: files
-    type: file-picker
-    label: "Files to review"
-    multiple: true
-    required: true
+Uses **JSON frontmatter** (delimited by `---json` / `---`) to avoid a YAML dependency. The markdown body after the frontmatter is the summarizer prompt template.
 
-  - id: focus
-    type: select
-    label: "Review focus"
-    options:
-      - label: Security
-        value: security
-      - label: Performance
-        value: performance
-      - label: Readability
-        value: readability
-      - label: All
-        value: all
-    default: all
-
-  - id: strict
-    type: toggle
-    label: "Strict mode (fail on warnings)"
-    default: false
-
-  - id: notes
-    type: text
-    label: "Additional notes"
-    placeholder: "Any specific concerns?"
+````markdown
+---json
+{
+  "name": "code-review",
+  "description": "Review code changes with configurable focus",
+  "actions": [
+    {
+      "id": "files",
+      "type": "file-picker",
+      "label": "Files to review",
+      "multiple": true,
+      "required": true
+    },
+    {
+      "id": "focus",
+      "type": "select",
+      "label": "Review focus",
+      "options": [
+        { "label": "Security", "value": "security" },
+        { "label": "Performance", "value": "performance" },
+        { "label": "Readability", "value": "readability" },
+        { "label": "All", "value": "all" }
+      ],
+      "default": "all"
+    },
+    {
+      "id": "strict",
+      "type": "toggle",
+      "label": "Strict mode (fail on warnings)",
+      "default": false
+    },
+    {
+      "id": "branch",
+      "type": "text",
+      "label": "Target branch",
+      "placeholder": "e.g. main",
+      "showWhen": { "strict": true }
+    },
+    {
+      "id": "notes",
+      "type": "text",
+      "label": "Additional notes",
+      "placeholder": "Any specific concerns?"
+    }
+  ]
+}
 ---
 
 You are generating a prompt for a code review agent. The user has selected
@@ -70,7 +85,7 @@ Generate a clear, actionable prompt that tells the reviewer:
 4. Any additional context from user notes
 
 Keep the prompt concise and direct.
-```
+````
 
 ### Action Types
 
@@ -84,6 +99,27 @@ Keep the prompt concise and direct.
 | `file-picker` | File browser integration | `string[]` (paths) |
 | `number` | Number input with optional min/max/step | `number` |
 
+### Conditional Actions (`showWhen`)
+
+Actions can declare a `showWhen` object that maps other action IDs to expected values. The action is only visible (and its value only included in the summary) when **all** conditions are met.
+
+```json
+{
+  "id": "branch",
+  "type": "text",
+  "label": "Target branch",
+  "showWhen": { "strict": true }
+}
+```
+
+Rules:
+- **Boolean match**: `{ "strict": true }` — show when `strict` toggle is on
+- **String match**: `{ "focus": "security" }` — show when `focus` select equals "security"
+- **Array includes**: `{ "focus": ["security", "performance"] }` — show when `focus` is one of the listed values
+- **Multiple conditions**: All must match (AND logic). OR is achieved by defining separate actions.
+- Hidden actions are excluded from the accumulated state and the summary text.
+- The UI re-evaluates visibility on every action change.
+
 ---
 
 ## Architecture
@@ -92,10 +128,10 @@ Keep the prompt concise and direct.
 
 ```
 src/sprinkles/
-  sprinkle-parser.ts      # Parse SPRINKLE.md (YAML frontmatter + markdown)
+  sprinkle-parser.ts      # Parse SPRINKLE.md (JSON frontmatter + markdown)
   sprinkle-manager.ts     # Load/manage sprinkle defs per scoop
   action-accumulator.ts   # Client-side state for accumulated actions
-  sprinkle-summarizer.ts  # Fast model (Haiku) LLM call to generate prompt
+  sprinkle-summarizer.ts  # LLM summary (Haiku or scoop model fallback)
   types.ts                # SprinkleDefinition, SprinkleAction, AccumulatedAction
 
 src/ui/
@@ -138,21 +174,23 @@ User clicks "Do it"
 ### Step 1: Core Types & Parser
 **Files**: `src/sprinkles/types.ts`, `src/sprinkles/sprinkle-parser.ts`
 
-- Define `SprinkleDefinition`, `SprinkleAction`, `ActionValue` types
-- Parse YAML frontmatter from SPRINKLE.md (reuse or add `yaml` dep)
+- Define `SprinkleDefinition`, `SprinkleAction`, `ActionValue`, `ShowWhenCondition` types
+- Parse JSON frontmatter from SPRINKLE.md (delimited by `---json` / `---`, parsed with `JSON.parse` — no deps)
 - Extract markdown body as the summarizer prompt template
-- Validate action definitions (required fields, valid types)
-- Tests: parser handles all action types, malformed YAML, missing fields
+- Validate action definitions (required fields, valid types, `showWhen` references valid action IDs)
+- Tests: parser handles all action types, malformed JSON, missing fields, conditional action validation
 
 ### Step 2: Action Accumulator
 **Files**: `src/sprinkles/action-accumulator.ts`
 
 - `ActionAccumulator` class: stateful per-sprinkle action collector
-- Methods: `set(actionId, value)`, `toggle(actionId)`, `reset()`, `getAll()`, `getSummaryText()`
-- `getSummaryText()` generates a structured text representation of accumulated actions (for the LLM summarizer input)
+- Methods: `set(actionId, value)`, `toggle(actionId)`, `reset()`, `getAll()`, `getVisible()`, `getSummaryText()`
+- `getVisible()` evaluates `showWhen` conditions against current state, returns only visible actions and their values
+- `getSummaryText()` generates a structured text representation of **visible** accumulated actions (for the LLM summarizer input)
 - Validates values against action type constraints (e.g., select value must be in options)
-- Observable: emits change events for UI reactivity
-- Tests: accumulate, reset, validation, serialization
+- Hidden actions' values are retained in state (so toggling a condition back shows previous selections) but excluded from `getVisible()` and `getSummaryText()`
+- Observable: emits change events for UI reactivity (including visibility changes)
+- Tests: accumulate, reset, validation, serialization, conditional visibility
 
 ### Step 3: Sprinkle Manager
 **Files**: `src/sprinkles/sprinkle-manager.ts`
@@ -170,12 +208,15 @@ User clicks "Do it"
 - `SprinkleSummarizer` class: generates natural language prompt from actions
 - Takes `SprinkleDefinition` (contains markdown template) + accumulated actions
 - Replaces `{{actions_summary}}` placeholder with `ActionAccumulator.getSummaryText()`
-- Calls Haiku via pi-ai with the filled template as system prompt
+- **Model selection logic** (uses `getAccounts()` from `provider-settings.ts`):
+  1. If an Anthropic-compatible account exists (provider `anthropic`, `amazon-bedrock`, `bedrock-camp`, or `azure-ai-foundry`), use Haiku via that account's credentials
+  2. Otherwise, use the scoop's current model (via `resolveCurrentModel()`)
+  3. This keeps summarization cheap/fast when possible, but always works regardless of provider
+- Calls the selected model via pi-ai with the filled template as system prompt
 - User message: "Generate the prompt."
 - Returns the LLM's response as the final lick prompt string
 - Fallback: if LLM call fails, send the raw `getSummaryText()` as the lick (degraded but functional)
-- Config: model override in localStorage (`sprinkle-summarizer-model`)
-- Tests: template filling, mock LLM call, fallback behavior
+- Tests: template filling, mock LLM call, fallback behavior, model selection logic
 
 ### Step 5: UI — Inline Renderer
 **Files**: `src/ui/sprinkle-inline.ts`
@@ -201,6 +242,7 @@ User clicks "Do it"
 **Files**: `src/ui/sprinkle-ui.ts`
 
 - `SprinkleUI` class: decides inline vs panel, manages lifecycle
+- **Visibility-aware layout**: counts only initially visible actions (those without `showWhen` or whose conditions are met at defaults) to decide inline vs panel. Re-evaluates if conditional actions push visible count past threshold.
 - Listens for scoop selection changes → loads appropriate sprinkles
 - Creates ActionAccumulator instances per sprinkle
 - Coordinates "Do it" click → summarizer → lick dispatch
@@ -236,16 +278,17 @@ User clicks "Do it"
 
 1. **Sprinkle versioning**: Should SPRINKLE.md support version fields for compatibility?
 2. **Sprinkle marketplace**: Integration with `upskill` for installing sprinkles from ClawHub?
-3. **Action dependencies**: Should actions conditionally show/hide based on other action values? (e.g., show "branch" field only when "deploy" toggle is on)
-4. **Undo/history**: Should accumulated actions persist across page reloads?
-5. **Sprinkle chaining**: Can one sprinkle's "Do it" trigger another sprinkle's setup?
+3. **Undo/history**: Should accumulated actions persist across page reloads?
+4. **Sprinkle chaining**: Can one sprinkle's "Do it" trigger another sprinkle's setup?
+5. **OR logic for showWhen**: Currently AND-only. Should we support `showWhenAny` for OR conditions?
 
 ---
 
 ## Dependencies
 
-- YAML parser: Need `yaml` npm package (or lightweight alternative like `js-yaml`) for frontmatter parsing
+- **No new dependencies** — JSON frontmatter parsed with built-in `JSON.parse`, no YAML library needed
 - pi-ai: Already available for LLM summarizer (Haiku calls)
+- provider-settings.ts: Already exports `getAccounts()` and `resolveCurrentModel()` for model selection
 - No new server endpoints needed (browser-first)
 
 ---
@@ -254,7 +297,8 @@ User clicks "Do it"
 
 | Risk | Mitigation |
 |------|-----------|
-| Haiku summarizer adds latency (~1-2s) | Fallback to raw action text if LLM fails or times out |
+| Summarizer adds latency (~1-2s) | Fallback to raw action text if LLM fails or times out |
 | SPRINKLE.md format too rigid | Start minimal, extend action types incrementally |
 | UI complexity in extension mode | Auto-select inline for extension, panel for standalone |
-| YAML parsing bundle size | Use lightweight parser or extract from existing deps |
+| Conditional actions create complex state | `showWhen` is AND-only, values retained when hidden, simple evaluation |
+| Non-Anthropic providers can't use Haiku | Graceful fallback to scoop's own model |
