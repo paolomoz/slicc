@@ -9,7 +9,7 @@ A natural voice conversation mode for SLICC where the user speaks, the agent res
 | Concern | Decision |
 |---------|----------|
 | TTS Provider | ElevenLabs (WebSocket streaming) |
-| What gets spoken | Narrative text only (auto-strip code, diffs, tool results) |
+| What gets spoken | Skill-driven conversational output + lightweight sanitizer |
 | Interruption | Barge-in (user speech stops TTS immediately) |
 | Echo handling | Web Audio API echo cancellation |
 | Listen cycle | Starts immediately, overlaps with TTS |
@@ -27,7 +27,7 @@ A natural voice conversation mode for SLICC where the user speaks, the agent res
 src/ui/voice-dialog/
   voice-dialog.ts        # VoiceDialog class — orchestrates the full loop
   tts-provider.ts        # TTS provider interface + ElevenLabs implementation
-  narrative-extractor.ts # Strips code/diffs/structured content from agent output
+  tts-sanitizer.ts       # Lightweight safety net: strips accidental markdown/code
   echo-canceller.ts      # Web Audio API echo cancellation pipeline
   audio-player.ts        # Streaming audio playback with barge-in support
 ```
@@ -39,8 +39,8 @@ src/ui/voice-dialog/
 │  VoiceDialog (orchestrator)                                  │
 │                                                              │
 │  ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐  │
-│  │ VoiceInput  │   │ AudioPlayer  │   │ NarrativeExtract │  │
-│  │ (existing)  │◄─►│  (new)       │   │ (new)            │  │
+│  │ VoiceInput  │   │ AudioPlayer  │   │ TTSSanitizer     │  │
+│  │ (existing)  │◄─►│  (new)       │   │ (~50 lines)      │  │
 │  └──────┬──────┘   └──────┬───────┘   └────────┬─────────┘  │
 │         │                 │                     │            │
 │         │          ┌──────┴───────┐             │            │
@@ -48,10 +48,10 @@ src/ui/voice-dialog/
 │         └─────────►│  (new)       │             │            │
 │                    └──────┬───────┘             │            │
 │                           │                     │            │
-│                    ┌──────┴───────┐             │            │
-│                    │ TTSProvider  │◄────────────┘            │
-│                    │ (ElevenLabs) │                           │
-│                    └──────────────┘                           │
+│         ┌────────┐ ┌──────┴───────┐             │            │
+│         │ SKILL  │ │ TTSProvider  │◄────────────┘            │
+│         │ .md    │ │ (ElevenLabs) │                          │
+│         └────────┘ └──────────────┘                          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,16 +100,19 @@ class VoiceDialog {
   isActive(): boolean;
   getState(): VoiceDialogState;
 
-  // Called by chat panel when agent response arrives
-  speakResponse(fullResponse: string): void;
+  // Feed streaming tokens from the agent response for real-time TTS
+  feedToken(token: string): void;
+
+  // Signal that the agent response is complete (flushes remaining audio)
+  endResponse(): void;
 }
 ```
 
 **Lifecycle:**
 1. User clicks dialog button → `start()` → init AudioContext, EchoCanceller, mic stream, STT
 2. User speaks → existing VoiceInput transcription pipeline → auto-send at 2.5s silence
-3. Agent streams response → `speakResponse()` called with full text at turn end
-4. NarrativeExtractor strips code → TTSProvider streams audio → AudioPlayer plays
+3. Agent streams response → tokens piped through TTSSanitizer → TTSProvider in real-time
+4. TTSProvider streams audio chunks → AudioPlayer plays (speech starts ~1-2s into response)
 5. If user speaks during playback → EchoCanceller flags real speech → barge-in → TTS stops
 6. Loop back to step 2
 
@@ -173,41 +176,47 @@ Client                          ElevenLabs WS
 
 **CORS note:** ElevenLabs WebSocket API allows direct browser connections with the API key in the initial message. No server proxy needed. In CLI mode, this works directly. In extension mode, add `wss://api.elevenlabs.io/*` to `host_permissions` in manifest.json.
 
-### 3. NarrativeExtractor (narrative-extractor.ts)
+### 3. TTSSanitizer (tts-sanitizer.ts)
 
-Parses agent responses and extracts only the parts suitable for speech.
+**The skill is the primary mechanism.** The voice-dialog SKILL.md instructs the agent to write conversational, voice-friendly responses — no code blocks, no tables, no markdown formatting. The agent's text response is already optimized for TTS.
 
-**Rules:**
-1. Strip fenced code blocks (``` ... ```)
-2. Strip inline code (`backtick content`)
-3. Strip tool call results and structured output
-4. Strip file paths longer than ~30 chars (speak short paths like "index.ts", skip "/src/ui/voice-dialog/echo-canceller.ts")
-5. Strip markdown formatting (bold, italic, headers → plain text)
-6. Strip tables
-7. Strip URLs
-8. Collapse whitespace and normalize punctuation for natural speech cadence
-9. If nothing remains after stripping → return a short fallback like "Done."
+The TTSSanitizer is a **lightweight safety net** (~50 lines) for when the agent occasionally ignores the skill:
 
-**Sentence-level streaming:**
-The extractor should emit text sentence-by-sentence as the agent streams, so TTS can start before the full response is ready:
+**Rules (applied to the streaming token output):**
+1. Strip fenced code blocks (``` ... ```) — agent sometimes can't resist
+2. Strip inline backticks (keep the word inside, drop the backticks)
+3. Flatten markdown bold/italic markers (`**text**` → `text`)
+4. Strip header markers (`## Foo` → `Foo`)
+5. Strip URLs (leave anchor text if present)
+6. Collapse multiple newlines into sentence breaks
+7. If the entire response was stripped → emit "Done."
+
+**What it does NOT do:**
+- No sentence detection or buffering — the skill ensures responses are already short and conversational
+- No markdown parsing library — simple regex passes are sufficient
+- No table detection — the skill says "don't use tables"
+
+**Streaming integration:**
+Tokens flow directly from the LLM stream through the sanitizer to the ElevenLabs WebSocket. The sanitizer operates on a small buffer (accumulates until a sentence boundary: `.!?` + whitespace), then emits clean text. This means TTS starts speaking after the agent's first sentence (~1-2s into streaming).
 
 ```typescript
-class NarrativeExtractor {
-  // Feed raw markdown chunks as they stream in
-  push(chunk: string): void;
+class TTSSanitizer {
+  // Feed streaming tokens, returns sanitized text ready for TTS (or null if buffering)
+  push(token: string): string | null;
 
-  // Get next complete sentence(s) ready for TTS
+  // Flush any remaining buffered text
   flush(): string | null;
 
-  // Reset state
+  // Reset state between turns
   reset(): void;
-
-  // Extract all narrative from a complete response
-  static extract(markdown: string): string;
 }
 ```
 
-Buffering strategy: accumulate chunks until a sentence boundary (`.`, `!`, `?` followed by space/newline). When a complete sentence is detected and it survives the stripping rules, emit it. This lets TTS start after the first sentence rather than waiting for the full response.
+**Why skill + sanitizer beats a full NarrativeExtractor:**
+- Zero added latency — tokens go straight from LLM to TTS
+- No lossy stripping — the agent writes for voice in the first place
+- The sanitizer catches edge cases, not the common path
+- Much less code to maintain (~50 lines vs ~300+)
 
 ### 4. EchoCanceller (echo-canceller.ts)
 
@@ -339,9 +348,9 @@ class AudioPlayer {
 - Test button ("Play sample")
 
 **Chat panel hooks:**
-- On `turn_end` event: if voice dialog active, pass response through `NarrativeExtractor` → `VoiceDialog.speakResponse()`
+- On streaming tokens: if voice dialog active, pipe each token through `VoiceDialog.feedToken()`
+- On `turn_end` event: call `VoiceDialog.endResponse()` to flush remaining audio
 - On barge-in: show visual indicator that TTS was interrupted
-- Voice dialog button disabled during agent processing (response not yet available)
 - Existing voice-input-only mode continues to work independently
 
 ---
@@ -365,11 +374,11 @@ class AudioPlayer {
 │      ▼                                                         │
 │  Agent processes (tools, code, etc.)                           │
 │      │                                                         │
-│      ▼  (turn_end event)                                       │
-│  NarrativeExtractor.extract(response)                          │
+│      ▼  (streaming tokens)                                     │
+│  TTSSanitizer.push(token) → clean sentences                    │
 │      │                                                         │
 │      ▼                                                         │
-│  TTSProvider.synthesize(narrative) → streaming audio chunks     │
+│  TTSProvider.synthesize(sentence) → streaming audio chunks      │
 │      │                                                         │
 │      ▼                                                         │
 │  AudioPlayer.enqueue(chunks) → speakers                        │
@@ -449,10 +458,11 @@ You are in voice conversation mode. The user is speaking to you and hearing your
 
 ## Implementation Order
 
-1. **NarrativeExtractor** — pure logic, fully testable, no dependencies
-2. **TTSProvider** (ElevenLabs) — WebSocket streaming, testable with mocks
-3. **AudioPlayer** — Web Audio API playback with queue and stop
-4. **EchoCanceller** — Web Audio API analysis pipeline
-5. **VoiceDialog** — orchestrator wiring everything together
-6. **UI integration** — button, settings panel, chat panel hooks
-7. **Extension manifest** — host_permissions for ElevenLabs WebSocket
+1. **Voice Dialog Skill** — SKILL.md file, the foundation that shapes agent output for voice
+2. **TTSSanitizer** — lightweight safety net (~50 lines), pure logic, fully testable
+3. **TTSProvider** (ElevenLabs) — WebSocket streaming, testable with mocks
+4. **AudioPlayer** — Web Audio API playback with queue and stop
+5. **EchoCanceller** — Web Audio API analysis pipeline
+6. **VoiceDialog** — orchestrator wiring everything together, streaming token pipeline
+7. **UI integration** — button, settings panel, chat panel hooks for token streaming
+8. **Extension manifest** — host_permissions for ElevenLabs WebSocket
