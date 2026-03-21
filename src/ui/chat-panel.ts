@@ -10,6 +10,8 @@ import { renderMessageContent, renderToolInput, escapeHtml } from './message-ren
 import { SessionStore } from './session-store.js';
 import { createLogger } from '../core/logger.js';
 import { VoiceInput, getVoiceAutoSend, getVoiceLang } from './voice-input.js';
+import { SprinkleBar } from './sprinkle-bar.js';
+import type { Sprinkle } from '../scoops/sprinkles.js';
 
 const log = createLogger('chat-panel');
 
@@ -72,6 +74,8 @@ export class ChatPanel {
   private readOnly = false;
   private terminalOutputCallback: ((text: string) => void) | null = null;
   private currentScoopName: string | null = null; // null = cone, string = scoop name
+  private sprinkleBar!: SprinkleBar;
+  private sprinkleBarEl!: HTMLElement;
   private autoScrollAttached = true;
   private lastScrollTop = 0;
   private jumpPill!: HTMLElement;
@@ -151,6 +155,16 @@ export class ChatPanel {
       this.messages = [];
     }
     this.renderMessages();
+  }
+
+  /** Set available sprinkles for the current scoop context. */
+  setSprinkles(sprinkles: Sprinkle[]): void {
+    if (sprinkles.length > 0 && this.currentScoopName !== null) {
+      this.sprinkleBar.setSprinkles(sprinkles);
+      this.sprinkleBar.show();
+    } else {
+      this.sprinkleBar.hide();
+    }
   }
 
   /** Set read-only mode (hide input for non-cone scoops). */
@@ -318,6 +332,16 @@ export class ChatPanel {
     svg.append(path1, path2, line1, line2);
     this.micBtn.appendChild(svg);
     this.micBtn.title = 'Voice input (Ctrl+Shift+V)';
+
+    // Sprinkle bar (batch actions) — rendered above the input area
+    this.sprinkleBarEl = document.createElement('div');
+    this.sprinkleBarEl.style.display = 'none'; // hidden until sprinkles are loaded for a scoop
+    this.sprinkleBar = new SprinkleBar(this.sprinkleBarEl);
+    this.sprinkleBar.onDoIt((prompt) => {
+      this.textarea.value = prompt;
+      this.sendMessage();
+    });
+    this.container.appendChild(this.sprinkleBarEl);
 
     inputArea.appendChild(this.textarea);
     inputArea.appendChild(this.micBtn);

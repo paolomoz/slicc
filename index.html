@@ -335,6 +335,54 @@
       }
 
       /* ------------------------------------------------------------------ */
+      /* Sprinkle bar                                                       */
+      /* ------------------------------------------------------------------ */
+      .sprinkle-bar {
+        padding: 6px 16px; background: #16162a;
+        border-bottom: 1px solid #2a2a4a;
+      }
+      .sprinkle-bar__buttons {
+        display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      }
+      .sprinkle-bar__group-label {
+        font-size: 11px; color: #5a5a7a; text-transform: uppercase;
+        letter-spacing: 0.5px; margin-right: 2px;
+      }
+      .sprinkle-bar__action {
+        padding: 4px 10px; border-radius: 12px; border: 1px solid #3a3a5a;
+        background: #222240; color: #a0a0b0; font-size: 12px;
+        cursor: pointer; transition: background .15s, border-color .15s, color .15s;
+      }
+      .sprinkle-bar__action:hover {
+        background: #2a2a4a; color: #e0e0e0; border-color: #4a4a6a;
+      }
+      .sprinkle-bar__action--active {
+        background: #3a1a2a; color: #e94560; border-color: #e94560;
+      }
+      .sprinkle-bar__action--active:hover {
+        background: #4a2a3a;
+      }
+      .sprinkle-bar__queue {
+        margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px;
+      }
+      .sprinkle-bar__queue-item {
+        display: flex; align-items: center; gap: 4px;
+        padding: 2px 8px; border-radius: 10px;
+        background: #2a2a4a; color: #c0c0d0; font-size: 11px;
+      }
+      .sprinkle-bar__queue-remove {
+        background: none; border: none; color: #5a5a7a; cursor: pointer;
+        font-size: 14px; padding: 0 2px; line-height: 1;
+      }
+      .sprinkle-bar__queue-remove:hover { color: #e94560; }
+      .sprinkle-bar__do-it {
+        margin-top: 6px; padding: 6px 20px; border-radius: 6px; border: none;
+        background: #e94560; color: #fff; font-size: 13px; font-weight: 600;
+        cursor: pointer; transition: background .15s;
+      }
+      .sprinkle-bar__do-it:hover { background: #d1334e; }
+
+      /* ------------------------------------------------------------------ */
       /* Panel headers                                                      */
       /* ------------------------------------------------------------------ */
       .panel-header {

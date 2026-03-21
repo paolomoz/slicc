@@ -16,6 +16,7 @@ import { BrowserAPI, DebuggerClient } from '../cdp/index.js';
 import { Orchestrator } from '../scoops/index.js';
 import type { RegisteredScoop, ChannelMessage } from '../scoops/types.js';
 import type { LickEvent } from '../scoops/lick-manager.js';
+import { loadSprinkles } from '../scoops/sprinkles.js';
 
 const log = createLogger('main');
 
@@ -615,6 +616,19 @@ async function main(): Promise<void> {
           }
         }
       }
+    }
+
+    // Load sprinkles for non-cone scoops
+    if (!scoop.isCone && sharedFs) {
+      try {
+        const sprinkles = await loadSprinkles(sharedFs, '/workspace/skills', scoop.name);
+        layout.panels.chat.setSprinkles(sprinkles);
+      } catch (err) {
+        log.warn('Failed to load sprinkles', { error: err instanceof Error ? err.message : String(err) });
+        layout.panels.chat.setSprinkles([]);
+      }
+    } else {
+      layout.panels.chat.setSprinkles([]);
     }
 
     // If switching back to cone and it's currently processing (e.g., handling
