@@ -333,6 +333,31 @@
         0%, 100% { transform: scale(1); opacity: 1; }
         50% { transform: scale(1.08); opacity: 0.85; }
       }
+      .chat__dialog-btn {
+        width: 38px; height: 38px; border: none; border-radius: 6px;
+        background: #2a2a4a; color: #a0a0b0; font-size: 16px;
+        cursor: pointer; display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; transition: background .15s, color .15s;
+      }
+      .chat__dialog-btn:hover { background: #3a3a5a; color: #e0e0e0; }
+      .chat__dialog-btn--active {
+        background: #2a3a4a; color: #7b68ee; border: 1px solid #7b68ee;
+      }
+      .chat__dialog-btn--listening {
+        background: #7b68ee; color: #fff; border: none;
+      }
+      .chat__dialog-btn--speaking {
+        background: #7b68ee; color: #fff; border: none;
+        animation: dialog-speak 1s ease-in-out infinite;
+      }
+      .chat__dialog-btn--filling {
+        background: #5a4fcf; color: #fff; border: none;
+        animation: dialog-speak 0.8s ease-in-out infinite;
+      }
+      @keyframes dialog-speak {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.1); }
+      }
 
       /* ------------------------------------------------------------------ */
       /* Panel headers                                                      */
