@@ -179,5 +179,5 @@ The sprinkle's `context` markdown (body content outside the Actions section) is 
 ## Open questions for implementation
 
 1. ~~Should the sprinkle bar go above or below the chat input textarea?~~ **Resolved: above the textarea.**
-2. Should action buttons show a count badge when the same action is queued multiple times, or disallow duplicates?
+2. ~~Should action buttons show a count badge when the same action is queued multiple times, or disallow duplicates?~~ **Resolved: disallow duplicates. Buttons toggle on/off.**
 3. Should the "Do it" button be styled prominently (primary color) or subtly?
