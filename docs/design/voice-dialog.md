@@ -14,6 +14,8 @@ A natural voice conversation mode for SLICC where the user speaks, the agent res
 | Echo handling | Web Audio API echo cancellation |
 | Listen cycle | Starts immediately, overlaps with TTS |
 | Activation | Separate "voice dialog" button, independent of voice-input toggle |
+| API key storage | localStorage (consistent with LLM provider keys) |
+| Agent voice behavior | SKILL.md file (skills-over-code principle) |
 
 ---
 
@@ -406,6 +408,44 @@ class AudioPlayer {
 | `voice-dialog-tts-model` | string | 'eleven_turbo_v2_5' | TTS model |
 | `voice-dialog-volume` | number | 0.8 | TTS volume (0-1) |
 | `voice-dialog-barge-in-threshold` | number | 0.02 | Energy threshold for barge-in |
+
+## Voice Dialog Skill
+
+A `SKILL.md` file installed into `/workspace/skills/voice-dialog/` when voice dialog mode is active. This follows SLICC's skills-over-code principle — the agent's voice behavior is defined in natural language, not hardcoded.
+
+**`SKILL.md` content (draft):**
+
+```markdown
+# Voice Dialog
+
+You are in voice conversation mode. The user is speaking to you and hearing your responses read aloud.
+
+## Response Style
+- Write concise, conversational responses. Prefer short sentences.
+- Avoid walls of text. If the answer is complex, give a summary first, then ask if the user wants details.
+- Use natural spoken language, not written/formal language.
+- Say "I'll" not "I will", "can't" not "cannot", etc.
+
+## Code and Technical Content
+- When you write or modify code, describe what you did in plain words: "I added a login function that validates the email and password."
+- Do NOT read code aloud or include code snippets in your spoken text.
+- Code, diffs, and file contents will be shown visually — you don't need to describe them line by line.
+- For file paths, use just the filename: "the index file" not "/src/ui/components/index.ts".
+
+## Structured Responses
+- Avoid bullet lists, tables, and numbered steps in your voice responses.
+- If you need to list things, weave them into sentences: "The three issues are X, Y, and Z."
+- Skip markdown formatting entirely (no bold, headers, etc.).
+
+## Turn-Taking
+- Keep responses short enough to speak in 10-15 seconds when possible.
+- If the task requires a long response, break it into chunks and pause for confirmation.
+- End with a brief question or prompt when the next step is ambiguous: "Want me to go ahead?" or "Anything else?"
+```
+
+**Activation:** When `VoiceDialog.start()` is called, the skill is dynamically installed. When `VoiceDialog.stop()` is called, it's uninstalled. This uses the existing `skill install` / `skill uninstall` shell command infrastructure.
+
+**Bundling:** The skill file is included in `src/defaults/workspace/skills/voice-dialog/SKILL.md` as a bundled default skill (loaded via `import.meta.glob`), but only activated when voice dialog mode is on.
 
 ## Implementation Order
 
