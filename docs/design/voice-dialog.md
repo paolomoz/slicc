@@ -16,6 +16,8 @@ A natural voice conversation mode for SLICC where the user speaks, the agent res
 | Activation | Separate "voice dialog" button, independent of voice-input toggle |
 | API key storage | localStorage (consistent with LLM provider keys) |
 | Agent voice behavior | SKILL.md file (skills-over-code principle) |
+| Silence filling | Fast-inference LLM (Cerebras/Groq) for instant acknowledgment + progress narration |
+| Filler-to-Claude handover | Single ElevenLabs WebSocket session, sentence-boundary cutover |
 
 ---
 
@@ -26,6 +28,7 @@ A natural voice conversation mode for SLICC where the user speaks, the agent res
 ```
 src/ui/voice-dialog/
   voice-dialog.ts        # VoiceDialog class — orchestrates the full loop
+  voice-filler.ts        # Fast-inference LLM filler for zero-silence UX
   tts-provider.ts        # TTS provider interface + ElevenLabs implementation
   tts-sanitizer.ts       # Lightweight safety net: strips accidental markdown/code
   echo-canceller.ts      # Web Audio API echo cancellation pipeline
@@ -35,24 +38,28 @@ src/ui/voice-dialog/
 ### Component Relationships
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  VoiceDialog (orchestrator)                                  │
-│                                                              │
-│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐  │
-│  │ VoiceInput  │   │ AudioPlayer  │   │ TTSSanitizer     │  │
-│  │ (existing)  │◄─►│  (new)       │   │ (~50 lines)      │  │
-│  └──────┬──────┘   └──────┬───────┘   └────────┬─────────┘  │
-│         │                 │                     │            │
-│         │          ┌──────┴───────┐             │            │
-│         │          │ EchoCanceller│             │            │
-│         └─────────►│  (new)       │             │            │
-│                    └──────┬───────┘             │            │
-│                           │                     │            │
-│         ┌────────┐ ┌──────┴───────┐             │            │
-│         │ SKILL  │ │ TTSProvider  │◄────────────┘            │
-│         │ .md    │ │ (ElevenLabs) │                          │
-│         └────────┘ └──────────────┘                          │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│  VoiceDialog (orchestrator)                                        │
+│                                                                    │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐        │
+│  │ VoiceInput  │   │ AudioPlayer  │   │ TTSSanitizer     │        │
+│  │ (existing)  │◄─►│  (new)       │   │ (~50 lines)      │        │
+│  └──────┬──────┘   └──────┬───────┘   └────────┬─────────┘        │
+│         │                 │                     │                  │
+│         │          ┌──────┴───────┐             │                  │
+│         │          │ EchoCanceller│             │                  │
+│         └─────────►│  (new)       │             │                  │
+│                    └──────┬───────┘             │                  │
+│                           │                     │                  │
+│  ┌──────────────┐  ┌──────┴───────┐             │                  │
+│  │ VoiceFiller  │─►│ TTSProvider  │◄────────────┘                  │
+│  │ (fast LLM)   │  │ (ElevenLabs) │                                │
+│  └──────────────┘  └──────────────┘  ┌────────┐                   │
+│         │                            │ SKILL  │                   │
+│         │  Both filler + Claude      │ .md    │                   │
+│         │  share one ElevenLabs WS   └────────┘                   │
+│         │  session = seamless voice                                │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -65,15 +72,17 @@ The top-level state machine that orchestrates the full speak-listen-respond loop
 
 **States:**
 ```
-IDLE → LISTENING → PROCESSING → SPEAKING → LISTENING
-                                    ↑          │
-                                    └──────────┘  (barge-in)
+IDLE → LISTENING → FILLING → SPEAKING → LISTENING
+                      │          ↑          │
+                      │          └──────────┘  (barge-in)
+                      │          │
+                      └──────────┘  (filler → Claude handover)
 ```
 
 - `IDLE`: Dialog mode off. No mic, no TTS.
 - `LISTENING`: Mic open, STT active, waiting for user speech. May overlap with SPEAKING.
-- `PROCESSING`: User utterance sent to agent, waiting for response.
-- `SPEAKING`: TTS playing agent response. Mic still open (echo-cancelled).
+- `FILLING`: Filler LLM generating spoken acknowledgments/progress while Claude processes. TTS playing filler audio. Transitions to SPEAKING when Claude starts streaming text.
+- `SPEAKING`: TTS playing Claude's response. Mic still open (echo-cancelled).
 
 **Barge-in transition:** While in SPEAKING state, if the echo canceller detects genuine user speech (not echo), immediately:
 1. Stop TTS playback (`AudioPlayer.stop()`)
@@ -87,9 +96,12 @@ interface VoiceDialogConfig {
   ttsApiKey: string;
   ttsVoiceId: string;
   ttsModel?: string;              // default: 'eleven_turbo_v2_5'
+  fillerApiKey: string;           // Cerebras/Groq API key
+  fillerModel: string;            // fast model ID
+  fillerBaseUrl: string;          // inference endpoint
   onStateChange: (state: VoiceDialogState) => void;
   onTranscript: (text: string, isFinal: boolean) => void;
-  onTTSText: (text: string) => void;  // narrative text being spoken
+  onTTSText: (text: string) => void;  // text being spoken (filler or Claude)
   onError: (error: string) => void;
   lang?: string;                  // STT language, default 'en-US'
 }
@@ -100,10 +112,17 @@ class VoiceDialog {
   isActive(): boolean;
   getState(): VoiceDialogState;
 
-  // Feed streaming tokens from the agent response for real-time TTS
+  // Called immediately when user message is sent — starts filler
+  onUserMessage(message: string): void;
+
+  // Feed tool events to filler for progressively smarter narration
+  feedToolStart(toolName: string, args: Record<string, unknown>): void;
+  feedToolResult(toolName: string, resultSummary: string): void;
+
+  // Feed streaming tokens from Claude's text response — triggers handover from filler
   feedToken(token: string): void;
 
-  // Signal that the agent response is complete (flushes remaining audio)
+  // Signal that Claude's response is complete (flushes remaining audio)
   endResponse(): void;
 }
 ```
@@ -111,10 +130,12 @@ class VoiceDialog {
 **Lifecycle:**
 1. User clicks dialog button → `start()` → init AudioContext, EchoCanceller, mic stream, STT
 2. User speaks → existing VoiceInput transcription pipeline → auto-send at 2.5s silence
-3. Agent streams response → tokens piped through TTSSanitizer → TTSProvider in real-time
-4. TTSProvider streams audio chunks → AudioPlayer plays (speech starts ~1-2s into response)
-5. If user speaks during playback → EchoCanceller flags real speech → barge-in → TTS stops
-6. Loop back to step 2
+3. Message sent → `onUserMessage()` → filler LLM starts speaking immediately (~200ms)
+4. Claude dispatches tools → `feedToolStart/Result()` → filler narrates progress
+5. Claude starts streaming text → `feedToken()` → filler wraps up → Claude's voice takes over (same WS)
+6. Claude tokens piped through TTSSanitizer → TTSProvider → AudioPlayer (speech continues seamlessly)
+7. If user speaks during playback → EchoCanceller flags real speech → barge-in → TTS stops
+8. Loop back to step 2
 
 ### 2. TTSProvider (tts-provider.ts)
 
@@ -329,7 +350,162 @@ class AudioPlayer {
 - On `stop()`: disconnect current source node, clear queue, reset playback state
 - All audio routed through a GainNode (for volume control and EchoCanceller reference)
 
-### 6. UI Integration
+### 6. VoiceFiller (voice-filler.ts)
+
+Generates instant spoken responses using a fast-inference LLM (Cerebras/Groq, ~1000-2000 tok/s) to eliminate silence while Claude processes. The filler and Claude share a single ElevenLabs WebSocket session, making the handover acoustically invisible.
+
+**The core UX problem:** Claude's tool-use loops (read file → edit → run tests) can take 5-30 seconds. Without filler, the user hears nothing during this time. With filler, they hear a continuous voice narrating what's happening.
+
+**Three-phase filler timeline:**
+
+```
+Time ───────────────────────────────────────────────────────────────────────►
+
+0ms              200ms              2-5s                 5-15s
+│                │                  │                    │
+User stops       Filler speaks     Tool results          Claude streams
+speaking         (from prompt      arrive, filler        text, handover
+                  alone)           narrates progress
+│                │                  │                    │
+▼                ▼                  ▼                    ▼
+"fix the null    "Sure, let me     "Okay, I see the     "The issue is
+ pointer in       take a look       handler — it's       that req.user
+ auth"            at that."         about 40 lines."     is accessed
+                                                         before the
+                                                         middleware
+                                                         runs..."
+```
+
+**Phase 0 — Prompt acknowledgment (immediate, ~200ms):**
+The filler sees only the user's message + a rolling context summary. It generates a brief, specific acknowledgment. This is the highest-value phase: it eliminates the *entire* dead silence gap.
+
+Filler prompt:
+```
+You are a voice assistant helping a developer. The user just said:
+"{user_message}"
+
+Context: {rolling_context_summary}
+
+Generate a brief, natural spoken acknowledgment (1 sentence, max 10 words).
+Be specific to what they asked. Don't just say "sure" or "okay".
+Examples: "Let me check that file." / "On it, I'll run the tests."
+```
+
+**Phase 1 — Tool dispatch narration:**
+As Claude dispatches tools, the filler receives tool names and arguments. It generates progress updates:
+- `read_file("src/auth/handler.ts")` → "I'm opening the auth handler now."
+- `bash("npm test")` → "Running the tests."
+- `edit_file(...)` → "Making some changes to the file."
+
+Filler prompt for Phase 1:
+```
+The assistant is currently performing this action: {tool_name}({tool_args_summary})
+Generate a brief spoken status update (1 sentence, max 12 words).
+Use natural language. Examples: "Opening that file now." / "Running the tests."
+```
+
+**Phase 2 — Tool result narration:**
+Tool results arrive. The filler can make substantive (but non-conclusive) observations:
+- Test output with failures → "Okay, looks like there are some test failures."
+- File contents → "I see the handler — it's about 40 lines."
+
+Filler prompt for Phase 2:
+```
+The assistant just completed: {tool_name}
+Result summary: {result_summary}
+Generate a brief spoken observation (1 sentence, max 15 words).
+IMPORTANT: Describe what you SEE, not what you CONCLUDE.
+- Say "I see some test failures" NOT "I'll fix the failing tests"
+- Say "the file has about 40 lines" NOT "the bug is on line 12"
+Never promise actions or state conclusions. Leave that to the main response.
+```
+
+**Handover to Claude:**
+
+When Claude starts streaming its text response, the filler must yield. The handover works because both filler and Claude feed text into the **same open ElevenLabs WebSocket session**:
+
+```
+ElevenLabs WS receives:
+  msg 1: { text: "Sure, let me take a look. " }          ← filler (Phase 0)
+  msg 2: { text: "Opening the auth handler now. " }       ← filler (Phase 1)
+  msg 3: { text: "I see the file, about 40 lines. " }    ← filler (Phase 2)
+  ── handover point ──
+  msg 4: { text: "The issue is that req dot user " }      ← Claude
+  msg 5: { text: "is accessed before the middleware " }   ← Claude
+  msg 6: { text: "runs." }                                ← Claude
+
+ElevenLabs treats all messages as one continuous utterance.
+Same voice, same prosody, no audible seam.
+```
+
+The handover sequence:
+1. Claude's first text token arrives → `VoiceFiller.prepareHandover()` called
+2. Filler finishes its current sentence (does NOT start a new one)
+3. ~200ms pause while Claude's first sentence buffers in TTSSanitizer
+4. Claude's first clean sentence emitted → sent to the same WS → audio continues
+
+**Rolling context summary:**
+
+The filler maintains a 2-3 sentence summary of the conversation, updated after each turn. This lets Phase 0 acknowledgments reference prior context:
+- Without context: "Let me look at that."
+- With context: "Let me check the auth handler we were working on."
+
+The summary is updated cheaply by the filler LLM itself after each turn completes (a single fast inference call).
+
+**Safety: filler never makes promises or conclusions:**
+
+The filler prompt is carefully constrained:
+- Phase 0: Acknowledge intent, never commit to outcome
+- Phase 1: Narrate actions, never predict results
+- Phase 2: Observe results, never diagnose causes
+- Conclusions and actions are exclusively Claude's domain
+
+This means the filler can never contradict Claude. "I see some test failures" is always true if the tests failed, regardless of what Claude says about them.
+
+**Graceful degradation:**
+
+If the filler LLM is unavailable (no API key, network error, rate limit):
+- Voice dialog works exactly as before — silence during tool use, then Claude's response
+- No error shown unless explicitly configured; filler is an enhancement, not a requirement
+- The `voice-dialog-filler-key` localStorage key being empty disables filler silently
+
+**Interface:**
+```typescript
+interface VoiceFillerConfig {
+  apiKey: string;           // Cerebras/Groq API key
+  model: string;            // fast model ID (e.g., 'llama-3.3-70b')
+  baseUrl: string;          // inference endpoint URL
+}
+
+class VoiceFiller {
+  constructor(config: VoiceFillerConfig);
+
+  // Phase 0: React to user prompt immediately
+  startFilling(userMessage: string): void;
+
+  // Phase 1: Tool dispatched — narrate the action
+  feedToolStart(toolName: string, args: Record<string, unknown>): void;
+
+  // Phase 2: Tool result arrived — observe the outcome
+  feedToolResult(toolName: string, resultSummary: string): void;
+
+  // Signal that Claude's text is starting — finish current sentence and yield
+  prepareHandover(): Promise<void>;
+
+  // Output — feeds into the shared ElevenLabs WS via TTSSanitizer
+  onText: ((text: string) => void) | null;
+
+  // Update rolling context after each completed turn
+  updateContext(turnSummary: string): void;
+
+  // Get current context summary (for debugging/display)
+  getContextSummary(): string;
+
+  stop(): void;
+}
+```
+
+### 7. UI Integration
 
 **New button** in chat panel (next to existing mic button):
 - Icon: headphones or waveform icon (distinct from mic icon)
@@ -346,9 +522,17 @@ class AudioPlayer {
 - Model selector (turbo_v2_5, multilingual_v2, etc.)
 - TTS volume slider
 - Test button ("Play sample")
+- Filler section (collapsible):
+  - Fast inference API key (password field)
+  - Endpoint URL (text field, default Cerebras)
+  - Model selector (text field, default llama-3.3-70b)
+  - Enable/disable filler toggle (independent of voice dialog toggle)
 
 **Chat panel hooks:**
-- On streaming tokens: if voice dialog active, pipe each token through `VoiceDialog.feedToken()`
+- On user message sent: if voice dialog active, call `VoiceDialog.onUserMessage(text)` to start filler
+- On tool dispatch: call `VoiceDialog.feedToolStart(name, args)` for filler narration
+- On tool result: call `VoiceDialog.feedToolResult(name, summary)` for filler observation
+- On streaming tokens: pipe each token through `VoiceDialog.feedToken()` (triggers handover + Claude TTS)
 - On `turn_end` event: call `VoiceDialog.endResponse()` to flush remaining audio
 - On barge-in: show visual indicator that TTS was interrupted
 - Existing voice-input-only mode continues to work independently
@@ -358,44 +542,64 @@ class AudioPlayer {
 ## Data Flow
 
 ```
-┌─────────────────────── Voice Dialog Loop ──────────────────────┐
-│                                                                │
-│  User speaks                                                   │
-│      │                                                         │
-│      ▼                                                         │
-│  Mic → EchoCanceller → Web Speech API (STT)                   │
-│      │                                                         │
-│      ▼                                                         │
-│  VoiceInput.onTranscript() → textarea preview                  │
-│      │                                                         │
-│      ▼  (2.5s silence)                                         │
-│  VoiceInput.onAutoSend() → orchestrator.handleMessage()        │
-│      │                                                         │
-│      ▼                                                         │
-│  Agent processes (tools, code, etc.)                           │
-│      │                                                         │
-│      ▼  (streaming tokens)                                     │
-│  TTSSanitizer.push(token) → clean sentences                    │
-│      │                                                         │
-│      ▼                                                         │
-│  TTSProvider.synthesize(sentence) → streaming audio chunks      │
-│      │                                                         │
-│      ▼                                                         │
-│  AudioPlayer.enqueue(chunks) → speakers                        │
-│      │                                    │                    │
-│      │    ┌───── Barge-in? ◄──────────────┘                    │
-│      │    │  (EchoCanceller detects real speech)                │
-│      │    │                                                    │
-│      │    ▼                                                    │
-│      │  AudioPlayer.stop()                                     │
-│      │  TTSProvider.abort()                                    │
-│      │  → back to "User speaks"                                │
-│      │                                                         │
-│      ▼  (TTS finishes naturally)                               │
-│  AudioPlayer.onComplete → ready for next utterance             │
-│  → back to "User speaks"                                       │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
+┌──────────────────────── Voice Dialog Loop ───────────────────────────┐
+│                                                                      │
+│  User speaks                                                         │
+│      │                                                               │
+│      ▼                                                               │
+│  Mic → EchoCanceller → Web Speech API (STT)                         │
+│      │                                                               │
+│      ▼                                                               │
+│  VoiceInput.onTranscript() → textarea preview                        │
+│      │                                                               │
+│      ▼  (2.5s silence)                                               │
+│  VoiceInput.onAutoSend() → orchestrator.handleMessage()              │
+│      │                                                               │
+│      ├──► Claude starts processing (tools, thinking)                 │
+│      │                                                               │
+│      └──► VoiceFiller.startFilling(userMessage)  ← IMMEDIATE        │
+│               │                                                      │
+│               ▼  (~200ms)                                            │
+│           Phase 0: "Sure, let me look at that."                      │
+│               │        │                                             │
+│               ▼        └──► TTSSanitizer ──► ElevenLabs WS ──► Audio │
+│           Tool dispatched                                            │
+│               │                                                      │
+│               ▼                                                      │
+│           Phase 1: "Opening the auth handler now."                   │
+│               │        │                                             │
+│               ▼        └──► same WS ──► Audio (seamless)             │
+│           Tool result arrives                                        │
+│               │                                                      │
+│               ▼                                                      │
+│           Phase 2: "I see the file, about 40 lines."                 │
+│               │        │                                             │
+│               ▼        └──► same WS ──► Audio (seamless)             │
+│                                                                      │
+│      Claude starts streaming text                                    │
+│               │                                                      │
+│               ▼                                                      │
+│           VoiceFiller.prepareHandover()                               │
+│           (filler finishes current sentence, yields)                 │
+│               │                                                      │
+│               ▼  ── handover ──                                      │
+│                                                                      │
+│  Claude tokens ──► TTSSanitizer ──► same WS ──► Audio (seamless)     │
+│      │                                                               │
+│      │                                      │                        │
+│      │    ┌───── Barge-in? ◄────────────────┘                        │
+│      │    │  (EchoCanceller detects real speech)                      │
+│      │    │                                                          │
+│      │    ▼                                                          │
+│      │  AudioPlayer.stop() + VoiceFiller.stop()                      │
+│      │  TTSProvider.abort()                                          │
+│      │  → back to "User speaks"                                      │
+│      │                                                               │
+│      ▼  (TTS finishes naturally)                                     │
+│  AudioPlayer.onComplete → VoiceFiller.updateContext()                │
+│  → back to "User speaks"                                             │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -417,6 +621,9 @@ class AudioPlayer {
 | `voice-dialog-tts-model` | string | 'eleven_turbo_v2_5' | TTS model |
 | `voice-dialog-volume` | number | 0.8 | TTS volume (0-1) |
 | `voice-dialog-barge-in-threshold` | number | 0.02 | Energy threshold for barge-in |
+| `voice-dialog-filler-key` | string | '' | Cerebras/Groq API key (empty = filler disabled) |
+| `voice-dialog-filler-model` | string | 'llama-3.3-70b' | Fast inference model ID |
+| `voice-dialog-filler-url` | string | 'https://api.cerebras.ai/v1' | Fast inference endpoint |
 
 ## Voice Dialog Skill
 
@@ -463,6 +670,7 @@ You are in voice conversation mode. The user is speaking to you and hearing your
 3. **TTSProvider** (ElevenLabs) — WebSocket streaming, testable with mocks
 4. **AudioPlayer** — Web Audio API playback with queue and stop
 5. **EchoCanceller** — Web Audio API analysis pipeline
-6. **VoiceDialog** — orchestrator wiring everything together, streaming token pipeline
-7. **UI integration** — button, settings panel, chat panel hooks for token streaming
-8. **Extension manifest** — host_permissions for ElevenLabs WebSocket
+6. **VoiceFiller** — fast-inference LLM client, three-phase generation, handover logic
+7. **VoiceDialog** — orchestrator wiring everything together, streaming token pipeline + filler coordination
+8. **UI integration** — button, settings panel (TTS + filler keys), chat panel hooks for token streaming + tool events
+9. **Extension manifest** — host_permissions for ElevenLabs WebSocket + fast inference endpoint
