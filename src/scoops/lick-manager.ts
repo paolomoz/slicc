@@ -32,8 +32,14 @@ export interface CronTaskEntry {
   createdAt: string;
 }
 
+/** A single sprinkle action accumulated by the user before dispatch. */
+export interface SprinkleAction {
+  id: string;
+  label: string;
+}
+
 export interface LickEvent {
-  type: 'webhook' | 'cron';
+  type: 'webhook' | 'cron' | 'sprinkle';
   webhookId?: string;
   webhookName?: string;
   cronId?: string;
@@ -42,6 +48,8 @@ export interface LickEvent {
   timestamp: string;
   headers?: Record<string, string>;
   body: unknown;
+  /** Accumulated sprinkle actions (only when type === 'sprinkle'). */
+  sprinkleActions?: SprinkleAction[];
 }
 
 export type LickEventHandler = (event: LickEvent) => void;

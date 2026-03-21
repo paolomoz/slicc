@@ -535,6 +535,48 @@ async function main(): Promise<void> {
     connectLickWs();
   }
 
+  // ---------------------------------------------------------------------------
+  // Sprinkles — batch action dispatch (works in both extension & CLI modes)
+  // ---------------------------------------------------------------------------
+  layout.panels.scoops.getSprinklesManager().onDispatch((scoopJid, actions) => {
+    const scoop = orchestrator.getScoop(scoopJid);
+    if (!scoop) {
+      log.warn('Sprinkle dispatch: scoop not found', { scoopJid });
+      return;
+    }
+
+    const actionLabels = actions.map(a => a.label);
+    const msgId = `sprinkle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const content = `[Sprinkle Actions]\nPlease perform the following actions:\n${actionLabels.map(l => `- ${l}`).join('\n')}`;
+
+    const msg: ChannelMessage = {
+      id: msgId,
+      chatJid: scoop.jid,
+      senderId: 'user',
+      senderName: 'sprinkle',
+      content,
+      timestamp: new Date().toISOString(),
+      fromAssistant: false,
+      channel: 'sprinkle',
+    };
+
+    getBuffer(scoop.jid).push({
+      id: msgId,
+      role: 'user',
+      content,
+      timestamp: Date.now(),
+      source: 'lick',
+      channel: 'sprinkle',
+    });
+
+    if (selectedScoop?.jid === scoop.jid) {
+      layout.panels.chat.addLickMessage(msgId, content, 'sprinkle');
+    }
+
+    log.info('Dispatching sprinkle lick', { scoopJid, actionCount: actions.length, actions: actionLabels });
+    orchestrator.handleMessage(msg);
+  });
+
   // Wire model picker changes
   layout.onModelChange = (modelId) => {
     localStorage.setItem('selected-model', modelId);
@@ -578,11 +620,11 @@ async function main(): Promise<void> {
         const messages = await orchestrator.getMessagesForScoop(scoop.jid);
         for (const msg of messages) {
           // Determine the proper role and source for display
-          const isLick = msg.channel === 'webhook' || msg.channel === 'cron';
+          const isLick = msg.channel === 'webhook' || msg.channel === 'cron' || msg.channel === 'sprinkle';
           const isDelegation = msg.channel === 'delegation';
 
           if (isLick) {
-            // Lick events - show as incoming with tongue emoji
+            // Lick events - show as incoming with appropriate icon
             const chatMsg: ChatMessage = {
               id: msg.id,
               role: 'user',

@@ -6,10 +6,12 @@
  * - Create/delete scoops
  * - Switch active scoop
  * - View scoop status
+ * - Sprinkles: per-scoop action buttons that accumulate and dispatch as a single lick
  */
 
 import type { RegisteredScoop, ScoopTabState } from '../scoops/types.js';
 import { Orchestrator } from '../scoops/orchestrator.js';
+import { SprinklesManager, DEFAULT_SPRINKLE_ACTIONS } from './sprinkles-manager.js';
 import { createLogger } from '../core/logger.js';
 
 const log = createLogger('scoops-panel');
@@ -27,11 +29,24 @@ export class ScoopsPanel {
   private callbacks: ScoopsPanelCallbacks;
   private selectedScoopJid: string | null = null;
   private scoopStatuses: Map<string, ScoopTabState['status']> = new Map();
+  private sprinklesManager: SprinklesManager;
+  private unsubSprinkles: (() => void) | null = null;
 
   constructor(container: HTMLElement, callbacks: ScoopsPanelCallbacks) {
     this.container = container;
     this.callbacks = callbacks;
+    this.sprinklesManager = new SprinklesManager();
     this.render();
+
+    // Re-render sprinkles UI when actions change
+    this.unsubSprinkles = this.sprinklesManager.onChange((scoopJid) => {
+      this.updateSprinklesUI(scoopJid);
+    });
+  }
+
+  /** Get the sprinkles manager (for wiring dispatch handler in main.ts). */
+  getSprinklesManager(): SprinklesManager {
+    return this.sprinklesManager;
   }
 
   /** Set the orchestrator instance */
@@ -75,6 +90,10 @@ export class ScoopsPanel {
       item.className = `scoop-item ${isSelected ? 'selected' : ''} status-${status}`;
       item.dataset.jid = scoop.jid;
 
+      // Top row: icon + info + delete
+      const topRow = document.createElement('div');
+      topRow.className = 'scoop-item__top';
+
       // Build DOM safely
       const iconEl = document.createElement('div');
       iconEl.className = scoop.isCone ? 'scoop-icon scoop-icon--cone' : 'scoop-icon scoop-icon--scoop';
@@ -85,7 +104,7 @@ export class ScoopsPanel {
         const hue = (scoopIndex * 72) % 360; // 72deg apart = 5 distinct colors before repeat
         iconEl.style.filter = `invert(0.85) sepia(1) saturate(4) hue-rotate(${hue}deg) brightness(1.05)`;
       }
-      item.appendChild(iconEl);
+      topRow.appendChild(iconEl);
 
       const infoEl = document.createElement('div');
       infoEl.className = 'scoop-info';
@@ -103,19 +122,39 @@ export class ScoopsPanel {
       statusEl.textContent = status;
       metaEl.appendChild(statusEl);
 
+      // Sprinkle pending count badge (next to status)
+      if (!scoop.isCone) {
+        const count = this.sprinklesManager.pendingCount(scoop.jid);
+        if (count > 0) {
+          const badge = document.createElement('span');
+          badge.className = 'sprinkle-badge';
+          badge.textContent = String(count);
+          metaEl.appendChild(badge);
+        }
+      }
+
       infoEl.appendChild(metaEl);
-      item.appendChild(infoEl);
+      topRow.appendChild(infoEl);
 
       if (!scoop.isCone) {
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'scoop-delete';
         deleteBtn.title = 'Delete scoop';
         deleteBtn.textContent = '\u00d7';
-        item.appendChild(deleteBtn);
+        topRow.appendChild(deleteBtn);
       }
 
-      item.addEventListener('click', (e) => {
-        if ((e.target as HTMLElement).classList.contains('scoop-delete')) {
+      item.appendChild(topRow);
+
+      // Sprinkles section (non-cone scoops only)
+      if (!scoop.isCone) {
+        item.appendChild(this.createSprinklesSection(scoop));
+      }
+
+      topRow.addEventListener('click', (e) => {
+        // Stop propagation so sprinkles clicks don't trigger selection
+        if ((e.target as HTMLElement).closest('.scoop-delete')) {
+          e.stopPropagation();
           this.deleteScoop(scoop.jid);
         } else {
           this.selectScoop(scoop);
@@ -123,6 +162,135 @@ export class ScoopsPanel {
       });
 
       listEl.appendChild(item);
+    }
+  }
+
+  /** Create the sprinkles section for a scoop item. */
+  private createSprinklesSection(scoop: RegisteredScoop): HTMLElement {
+    const section = document.createElement('div');
+    section.className = 'sprinkles-section';
+    section.dataset.scoopJid = scoop.jid;
+
+    // Action buttons row
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'sprinkles-actions';
+
+    for (const action of DEFAULT_SPRINKLE_ACTIONS) {
+      const btn = document.createElement('button');
+      btn.className = 'sprinkle-action-btn';
+      btn.textContent = action.label;
+      btn.title = `Add "${action.label}" to pending actions`;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.sprinklesManager.addAction(scoop.jid, action.label);
+      });
+      actionsRow.appendChild(btn);
+    }
+
+    section.appendChild(actionsRow);
+
+    // Pending pills + do-it / clear buttons
+    const pendingRow = document.createElement('div');
+    pendingRow.className = 'sprinkles-pending';
+    pendingRow.dataset.scoopJid = scoop.jid;
+
+    this.renderPendingPills(pendingRow, scoop.jid);
+    section.appendChild(pendingRow);
+
+    return section;
+  }
+
+  /** Render the pending action pills and do-it/clear buttons into the container. */
+  private renderPendingPills(container: HTMLElement, scoopJid: string): void {
+    while (container.firstChild) container.removeChild(container.firstChild);
+
+    const actions = this.sprinklesManager.getActions(scoopJid);
+    if (actions.length === 0) return;
+
+    // Pills
+    const pillsWrap = document.createElement('div');
+    pillsWrap.className = 'sprinkles-pills';
+
+    for (const action of actions) {
+      const pill = document.createElement('span');
+      pill.className = 'sprinkle-pill';
+
+      const pillLabel = document.createElement('span');
+      pillLabel.textContent = action.label;
+      pill.appendChild(pillLabel);
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'sprinkle-pill__remove';
+      removeBtn.textContent = '\u00d7';
+      removeBtn.title = 'Remove action';
+      removeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.sprinklesManager.removeAction(scoopJid, action.id);
+      });
+      pill.appendChild(removeBtn);
+
+      pillsWrap.appendChild(pill);
+    }
+
+    container.appendChild(pillsWrap);
+
+    // Buttons row
+    const btnsRow = document.createElement('div');
+    btnsRow.className = 'sprinkles-dispatch';
+
+    const doItBtn = document.createElement('button');
+    doItBtn.className = 'sprinkle-do-it-btn';
+    doItBtn.textContent = 'Do it';
+    doItBtn.title = 'Send all pending actions as a single lick';
+    doItBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.sprinklesManager.dispatch(scoopJid);
+    });
+    btnsRow.appendChild(doItBtn);
+
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'sprinkle-clear-btn';
+    clearBtn.textContent = 'Clear';
+    clearBtn.title = 'Clear pending actions';
+    clearBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.sprinklesManager.clear(scoopJid);
+    });
+    btnsRow.appendChild(clearBtn);
+
+    container.appendChild(btnsRow);
+  }
+
+  /** Update only the sprinkles pending UI for a specific scoop (avoids full re-render). */
+  private updateSprinklesUI(scoopJid: string): void {
+    // Update pending row
+    const pendingRow = this.container.querySelector(
+      `.sprinkles-pending[data-scoop-jid="${scoopJid}"]`
+    ) as HTMLElement | null;
+    if (pendingRow) {
+      this.renderPendingPills(pendingRow, scoopJid);
+    }
+
+    // Update badge in meta
+    const scoopItem = this.container.querySelector(`.scoop-item[data-jid="${scoopJid}"]`);
+    if (scoopItem) {
+      const existingBadge = scoopItem.querySelector('.sprinkle-badge');
+      const count = this.sprinklesManager.pendingCount(scoopJid);
+      if (count > 0) {
+        if (existingBadge) {
+          existingBadge.textContent = String(count);
+        } else {
+          const metaEl = scoopItem.querySelector('.scoop-meta');
+          if (metaEl) {
+            const badge = document.createElement('span');
+            badge.className = 'sprinkle-badge';
+            badge.textContent = String(count);
+            metaEl.appendChild(badge);
+          }
+        }
+      } else {
+        existingBadge?.remove();
+      }
     }
   }
 
@@ -180,6 +348,9 @@ export class ScoopsPanel {
       alert(msg);
       return;
     }
+
+    // Clear any pending sprinkles for the deleted scoop
+    this.sprinklesManager.clear(jid);
 
     if (this.selectedScoopJid === jid) {
       this.selectedScoopJid = null;
@@ -322,13 +493,19 @@ export class ScoopsPanel {
 
       .scoop-item {
         display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px 12px;
+        flex-direction: column;
+        padding: 0;
         border-radius: 8px;
         cursor: pointer;
         transition: background 0.15s;
         margin-bottom: 4px;
+      }
+
+      .scoop-item__top {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 12px;
       }
 
       .scoop-item:hover {
@@ -418,7 +595,127 @@ export class ScoopsPanel {
         background: #5a2d2d;
         color: #ee9090;
       }
+
+      /* ── Sprinkles ─────────────────────────────────────── */
+
+      .sprinkles-section {
+        padding: 4px 12px 8px 44px; /* left indent to align under scoop name */
+      }
+
+      .sprinkles-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-bottom: 4px;
+      }
+
+      .sprinkle-action-btn {
+        padding: 2px 8px;
+        border: 1px solid #3a3a5a;
+        border-radius: 4px;
+        background: #1e1e3a;
+        color: #c0c0d0;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.12s, border-color 0.12s;
+      }
+
+      .sprinkle-action-btn:hover {
+        background: #2a2a5a;
+        border-color: #5a5a8a;
+      }
+
+      .sprinkle-badge {
+        padding: 0 5px;
+        border-radius: 8px;
+        background: #e94560;
+        color: white;
+        font-size: 10px;
+        font-weight: 600;
+        min-width: 14px;
+        text-align: center;
+      }
+
+      .sprinkles-pending {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .sprinkles-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px;
+      }
+
+      .sprinkle-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: #2d3a5a;
+        color: #b0c0e0;
+        font-size: 11px;
+      }
+
+      .sprinkle-pill__remove {
+        border: none;
+        background: transparent;
+        color: #808090;
+        font-size: 12px;
+        cursor: pointer;
+        padding: 0 1px;
+        line-height: 1;
+      }
+
+      .sprinkle-pill__remove:hover {
+        color: #ee9090;
+      }
+
+      .sprinkles-dispatch {
+        display: flex;
+        gap: 4px;
+        margin-top: 2px;
+      }
+
+      .sprinkle-do-it-btn {
+        padding: 3px 12px;
+        border: none;
+        border-radius: 4px;
+        background: #e94560;
+        color: white;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.12s;
+      }
+
+      .sprinkle-do-it-btn:hover {
+        background: #ff6b8a;
+      }
+
+      .sprinkle-clear-btn {
+        padding: 3px 8px;
+        border: 1px solid #3a3a5a;
+        border-radius: 4px;
+        background: transparent;
+        color: #808090;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.12s, color 0.12s;
+      }
+
+      .sprinkle-clear-btn:hover {
+        background: #2a2a4a;
+        color: #c0c0d0;
+      }
     `;
     this.container.appendChild(style);
+  }
+
+  /** Dispose the panel. */
+  dispose(): void {
+    this.unsubSprinkles?.();
   }
 }

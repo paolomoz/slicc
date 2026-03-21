@@ -192,8 +192,8 @@ export class ChatPanel {
     this.persistSession();
   }
 
-  /** Add a lick message (webhook/cron event). */
-  addLickMessage(id: string, content: string, channel: 'webhook' | 'cron'): void {
+  /** Add a lick message (webhook/cron/sprinkle event). */
+  addLickMessage(id: string, content: string, channel: 'webhook' | 'cron' | 'sprinkle'): void {
     const msg: ChatMessage = {
       id,
       role: 'user',
@@ -655,7 +655,7 @@ export class ChatPanel {
 
   private createMessageEl(msg: ChatMessage): HTMLElement {
     // Licks (webhook/cron) get their own compact style like tool calls
-    const isLick = msg.source === 'lick' || msg.channel === 'webhook' || msg.channel === 'cron';
+    const isLick = msg.source === 'lick' || msg.channel === 'webhook' || msg.channel === 'cron' || msg.channel === 'sprinkle';
     if (isLick) {
       const wrapper = document.createElement('div');
       wrapper.className = 'msg-group';
@@ -725,7 +725,7 @@ export class ChatPanel {
     el.appendChild(roleEl);
 
     // For lick messages in cone view, wrap content in collapsible
-    const isLickInCone = (msg.source === 'lick' || msg.channel === 'webhook' || msg.channel === 'cron') && this.sessionId === 'session-cone';
+    const isLickInCone = (msg.source === 'lick' || msg.channel === 'webhook' || msg.channel === 'cron' || msg.channel === 'sprinkle') && this.sessionId === 'session-cone';
     // For scoop messages in cone view, wrap in collapsible
     const isScoopInCone = msg.source && msg.source !== 'cone' && msg.source !== 'lick' && msg.role === 'assistant' && this.sessionId === 'session-cone';
 
@@ -780,12 +780,13 @@ export class ChatPanel {
     const el = document.createElement('details');
     el.className = 'lick';
 
-    const channelType = msg.channel === 'webhook' ? 'Webhook' : msg.channel === 'cron' ? 'Cron' : 'Event';
+    const channelType = msg.channel === 'webhook' ? 'Webhook' : msg.channel === 'cron' ? 'Cron' : msg.channel === 'sprinkle' ? 'Sprinkle' : 'Event';
 
     // Summary shows tongue emoji and type
     const summary = document.createElement('summary');
     summary.className = 'lick__header';
-    summary.innerHTML = `<span class="lick__icon">👅</span> <span class="lick__type">${channelType}</span>`;
+    const lickIcon = msg.channel === 'sprinkle' ? '\u2728' : '\uD83D\uDC45'; // ✨ for sprinkle, 👅 for others
+    summary.innerHTML = `<span class="lick__icon">${lickIcon}</span> <span class="lick__type">${channelType}</span>`;
 
     // Add brief preview
     const preview = document.createElement('span');
