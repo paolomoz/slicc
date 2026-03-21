@@ -73,10 +73,14 @@ The top-level state machine that orchestrates the full speak-listen-respond loop
 **States:**
 ```
 IDLE → LISTENING → FILLING → SPEAKING → LISTENING
-                      │          ↑          │
-                      │          └──────────┘  (barge-in)
-                      │          │
-                      └──────────┘  (filler → Claude handover)
+                      │ ↑        ↑          │
+                      │ │        └──────────┘  (barge-in)
+                      │ │        │
+                      └─┘────────┘  (filler → Claude handover)
+
+Barge-in works from ANY non-IDLE state:
+  FILLING  + user speech → stop filler + TTS → LISTENING
+  SPEAKING + user speech → stop Claude TTS   → LISTENING
 ```
 
 - `IDLE`: Dialog mode off. No mic, no TTS.
@@ -84,11 +88,13 @@ IDLE → LISTENING → FILLING → SPEAKING → LISTENING
 - `FILLING`: Filler LLM generating spoken acknowledgments/progress while Claude processes. TTS playing filler audio. Transitions to SPEAKING when Claude starts streaming text.
 - `SPEAKING`: TTS playing Claude's response. Mic still open (echo-cancelled).
 
-**Barge-in transition:** While in SPEAKING state, if the echo canceller detects genuine user speech (not echo), immediately:
+**Barge-in transition:** While in FILLING or SPEAKING state, if the echo canceller detects genuine user speech (not echo), immediately:
 1. Stop TTS playback (`AudioPlayer.stop()`)
-2. Cancel any pending TTS chunks
-3. Transition to LISTENING (already there since mic was open)
-4. Accumulate the new utterance normally
+2. If FILLING: abort filler LLM inference (`VoiceFiller.stop()`)
+3. Cancel any pending TTS chunks (`TTSProvider.abort()`)
+4. Abort Claude's in-flight response if desired (optional — user can configure)
+5. Transition to LISTENING (mic was already open)
+6. Accumulate the new utterance normally
 
 **Interface:**
 ```typescript
@@ -194,6 +200,37 @@ Client                          ElevenLabs WS
 - `voice-dialog-tts-key`: ElevenLabs API key
 - `voice-dialog-tts-voice`: Voice ID (default: a preset natural voice)
 - `voice-dialog-tts-model`: Model ID (default: `eleven_turbo_v2_5`)
+
+**WebSocket session lifetime and keepalive:**
+
+ElevenLabs closes idle WebSocket connections after **20 seconds of inactivity** (no text messages sent). During a filler→Claude pipeline, gaps can exceed this — e.g., Claude reads a large file (tool takes 3s), thinks (5s), then starts another tool (2s more). The filler might not have anything to say during part of this window.
+
+Keepalive strategy:
+1. TTSProvider sends a **single space `{ text: " " }`** every 15 seconds when the WS is open but no text is flowing
+2. ElevenLabs ignores whitespace-only text (no audio generated, no billing)
+3. Keepalive starts automatically when the WS opens and stops when it closes
+4. The keepalive timer resets on every real text send (filler or Claude)
+5. If the WS closes unexpectedly mid-turn, TTSProvider reconnects transparently — the filler/Claude text pipeline doesn't know or care
+
+```typescript
+// Inside ElevenLabsTTSProvider
+private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+
+private startKeepalive(): void {
+  this.keepaliveInterval = setInterval(() => {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ text: ' ' }));
+    }
+  }, 15_000);
+}
+
+private resetKeepalive(): void {
+  if (this.keepaliveInterval) clearInterval(this.keepaliveInterval);
+  this.startKeepalive();
+}
+```
+
+This is a non-issue for most turns (filler keeps the WS active). The keepalive is a safety net for the edge case where filler is disabled or between batched tool events.
 
 **CORS note:** ElevenLabs WebSocket API allows direct browser connections with the API key in the initial message. No server proxy needed. In CLI mode, this works directly. In extension mode, add `wss://api.elevenlabs.io/*` to `host_permissions` in manifest.json.
 
@@ -420,6 +457,42 @@ IMPORTANT: Describe what you SEE, not what you CONCLUDE.
 Never promise actions or state conclusions. Leave that to the main response.
 ```
 
+**Rapid-fire tool batching:**
+
+Claude often dispatches multiple tools in quick succession (read 3 files, then edit, then run tests). Narrating each individually would produce choppy, overwhelming audio. The filler batches rapid-fire events:
+
+```
+Tool events timeline:
+
+0ms     read_file("auth.ts")     ─┐
+50ms    read_file("middleware.ts") ─┤  within 800ms window
+200ms   read_file("types.ts")    ─┘
+                                    → batched: "Reading a few files in the auth module."
+
+1500ms  edit_file("auth.ts")       → standalone (>800ms gap): "Making some changes now."
+
+2000ms  bash("npm test")           → standalone: "Running the tests."
+```
+
+**Batching rules:**
+1. On `feedToolStart()`, start an 800ms debounce timer
+2. If another `feedToolStart()` arrives within 800ms, accumulate it into the batch
+3. When the timer fires (no new tool for 800ms), generate ONE filler sentence for the batch
+4. Batch prompt includes all accumulated tool names/args:
+   ```
+   The assistant is performing these actions:
+   - read_file("src/auth/handler.ts")
+   - read_file("src/auth/middleware.ts")
+   - read_file("src/auth/types.ts")
+   Generate a brief spoken summary (1 sentence, max 12 words).
+   Example: "Reading through a few files in the auth module."
+   ```
+5. `feedToolResult()` follows the same batching — multiple results within 800ms get one observation
+
+**Why 800ms?** Fast enough that the user doesn't notice a gap (filler was already speaking from Phase 0 or a prior narration). Slow enough to catch Claude's typical burst patterns (parallel tool calls resolve within ~200-500ms of each other).
+
+**Cap:** If a batch accumulates more than 5 tools, emit immediately without waiting for the timer. At that point, a summary like "Working through several files" is better than waiting.
+
 **Handover to Claude:**
 
 When Claude starts streaming its text response, the filler must yield. The handover works because both filler and Claude feed text into the **same open ElevenLabs WebSocket session**:
@@ -443,6 +516,24 @@ The handover sequence:
 2. Filler finishes its current sentence (does NOT start a new one)
 3. ~200ms pause while Claude's first sentence buffers in TTSSanitizer
 4. Claude's first clean sentence emitted → sent to the same WS → audio continues
+
+**Handover timeout (500ms hard cut):**
+
+`prepareHandover()` returns a Promise that resolves when the filler finishes its current sentence. But the filler might be mid-inference or waiting on a slow response. To prevent blocking Claude's voice:
+
+```
+prepareHandover() called
+    │
+    ├─── filler finishes sentence within 500ms? → resolve, clean transition
+    │
+    └─── 500ms elapsed, filler still generating? → hard cut:
+              1. Abort filler inference immediately
+              2. Discard any partial sentence in filler buffer
+              3. Send a brief silence gap to ElevenLabs (empty text + flush)
+              4. Resolve promise → Claude's text starts flowing
+```
+
+The 500ms budget is generous — at ~1500 tok/s, the filler can generate ~30 tokens (a full sentence) in 200ms. The timeout only fires if the filler LLM itself is slow or hung. The user hears at most a brief pause (~200ms of silence from the flush), then Claude's voice picks up.
 
 **Rolling context summary:**
 
@@ -607,6 +698,7 @@ class VoiceFiller {
 ## Extension Mode Considerations
 
 - **WebSocket to ElevenLabs**: Requires `wss://api.elevenlabs.io/*` in manifest.json `host_permissions`
+- **Filler LLM endpoint**: Requires `https://api.cerebras.ai/*` and `https://api.groq.com/*` in manifest.json `host_permissions` (both added so users can switch providers without extension update). Custom endpoints require the user to add their own `host_permissions` entry or use CLI mode.
 - **AudioContext**: Works in side panel (no CSP issue)
 - **Mic access**: Reuses existing popup-based permission flow from voice-input
 - **API key storage**: localStorage (same pattern as provider API keys)
@@ -673,4 +765,4 @@ You are in voice conversation mode. The user is speaking to you and hearing your
 6. **VoiceFiller** — fast-inference LLM client, three-phase generation, handover logic
 7. **VoiceDialog** — orchestrator wiring everything together, streaming token pipeline + filler coordination
 8. **UI integration** — button, settings panel (TTS + filler keys), chat panel hooks for token streaming + tool events
-9. **Extension manifest** — host_permissions for ElevenLabs WebSocket + fast inference endpoint
+9. **Extension manifest** — host_permissions for ElevenLabs WebSocket (`wss://api.elevenlabs.io/*`) + filler endpoints (`https://api.cerebras.ai/*`, `https://api.groq.com/*`)
