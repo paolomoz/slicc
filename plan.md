@@ -138,7 +138,7 @@ The sprinkle's `context` markdown (body content outside the Actions section) is 
 - CSS: inline styles (matching existing codebase pattern — no external CSS files)
 
 ### Step 4: Wire into ChatPanel / main.ts
-- ChatPanel gets a `SprinkleBar` instance rendered below the input area
+- ChatPanel gets a `SprinkleBar` instance rendered above the input textarea
 - On scoop switch (`switchToContext`):
   - Load sprinkles for the new scoop via `loadSprinkles(fs, scoopName)`
   - Update the SprinkleBar with `setSprinkles()`
@@ -178,6 +178,6 @@ The sprinkle's `context` markdown (body content outside the Actions section) is 
 
 ## Open questions for implementation
 
-1. Should the sprinkle bar go above or below the chat input textarea?
+1. ~~Should the sprinkle bar go above or below the chat input textarea?~~ **Resolved: above the textarea.**
 2. Should action buttons show a count badge when the same action is queued multiple times, or disallow duplicates?
 3. Should the "Do it" button be styled prominently (primary color) or subtly?
