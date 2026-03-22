@@ -1,125 +1,125 @@
 # SLICC Demo Video — Script
 
-> **Length**: ~2 minutes | **Tone**: Casual, developer-friendly | **Recording**: Real SLICC, no mocks | **Format**: Screen recording + AI voiceover
+> **Length**: ~2 minutes | **Tone**: Casual, conversational | **Recording**: Real SLICC | **Format**: Screen recording, dialog between user and SLICC
+
+The demo is a conversation. SLICC introduces itself, the user jumps in with real requests, and SLICC delivers. No narrator — just a user and their agent.
 
 ---
 
-## Act 0 — Intro Slide (0:00–0:05)
+## Act 1 — Launch & Welcome (0:00–0:20)
 
-**Visual**: Branded slide. Ice cream cone logo, "slicc" wordmark, tagline.
+**Visual**: Clean macOS desktop. Sliccstart is open. User clicks Chrome. SLICC workspace appears — chat, terminal, files, all visible. SLICC sends a welcome message in chat.
 
-**Voiceover**:
-> Meet SLICC — your AI agent that lives in the browser and gets things done.
+**SLICC** (chat bubble):
+> Hey! I'm SLICC — I run right here in your browser. I've got a shell, a filesystem, browser automation, and I can spin up sub-agents when things get busy. What are we working on?
 
----
-
-## Act 1 — The Launch (0:05–0:15)
-
-**Visual**: Clean macOS desktop. Sliccstart is open showing detected browsers and apps. User clicks Chrome. SLICC workspace opens — chat panel, terminal, files, all visible.
-
-**Voiceover**:
-> SLICC launches from Sliccstart, a native macOS app. One click and you've got a full workspace — chat, terminal, files, browser automation — all running inside Chrome.
+**User** (types):
+> First, can you open a tab and check what's trending on Hacker News? I want to see what's going on while we set things up.
 
 ---
 
-## Act 2 — Connect Your World (0:15–0:35)
+## Act 2 — Background Work + Tray Setup (0:20–0:50)
 
-**Visual**: Back to Sliccstart. User clicks Slack — Slack opens with the SLICC overlay injected (ice cream logo visible). Then clicks VS Code — same thing, SLICC overlay appears inside VS Code. Quick montage: three windows side by side, all showing the SLICC panel.
+**Visual**: SLICC opens a new browser tab, navigates to Hacker News, starts summarizing. Meanwhile the user keeps chatting — SLICC is doing work in the background (visible in terminal/scoop panel).
 
-**Voiceover**:
-> But SLICC doesn't just live in a browser tab. Click any Electron app — Slack, VS Code, whatever — and SLICC injects itself right in. Same agent, same workspace, available wherever you're already working. It connects to your apps, not the other way around.
+**SLICC** (chat):
+> On it — I'll grab the front page and pull together a summary. What else?
 
----
+**User** (types):
+> I want to connect a couple of desktop apps too. Can you give me the tray join URL so I can onboard Slack and VS Code?
 
-## Act 3 — The Morning Catch-Up (0:35–1:00)
+**SLICC** (chat):
+> Sure, here's your tray URL: `https://tray.slicc.dev/join/xxxxx`. Any app that connects to this can be part of our session. I'll keep working on the HN summary while you set that up.
 
-**Visual**: Main SLICC Chrome window. User types: *"Hey Slicc, catch me up — what's important in Slack today and are there any open PRs that need my review?"* SLICC responds, spins up two scoops (visible in the scoop panel). One scoop reads Slack messages, the other checks GitHub. Both work simultaneously. Results come back — a sprinkle card appears in chat showing a structured summary: Slack highlights on one side, PR statuses on the other.
-
-**Voiceover**:
-> Start your day with a simple question. SLICC spins up parallel agents — one checks Slack, one checks GitHub — and comes back with an interactive summary. Not a wall of text — an actual interface, generated on the fly. Click into anything to dig deeper.
-
----
-
-## Act 4 — Real Coding: AEM Edge Delivery News Block (1:00–1:35)
-
-**Visual**: User types: *"Our Edge Delivery site needs a live news feed. Build me a news-headlines block that fetches from a public news API and displays articles with thumbnails, titles, and publish dates. Follow the EDS block conventions."*
-
-SLICC works — visible in both terminal and file panel:
-1. Creates `blocks/news-headlines/` folder
-2. Writes `news-headlines.js` — fetches from a public news API (e.g. GNews, NewsData.io), parses the JSON, renders article cards with thumbnail, headline, source, and date
-3. Writes `news-headlines.css` — responsive card grid layout, thumbnail styling, hover states
-4. Shows the code briefly in the file panel (audience sees real EDS-pattern code: `export default async function decorate(block)`)
-5. SLICC opens a browser preview tab — the block renders with live headlines and images pulled from the API
-
-**Key on-screen moments**: The file tree expanding with the new folder. The JS `fetch()` call visible in code. The preview loading with real news thumbnails.
-
-**Voiceover**:
-> Now the real stuff. This Edge Delivery site has no news section — let's add one. SLICC builds a news-headlines block from scratch — fetches from a live API, renders a card grid with thumbnails, all following EDS conventions. And it previews the result right in the browser it's running in. Real articles, real data, real code — in about thirty seconds.
+**Visual**: SLICC shows the tray URL. Meanwhile in the background, the HN summary is being built — visible as a scoop working. User switches to Sliccstart.
 
 ---
 
-## Act 5 — Ship It (1:35–1:50)
+## Act 3 — Connecting Electron Apps (0:50–1:15)
 
-**Visual**: User types: *"Looks good. Commit and push this, then let Sarah know on Slack that the news block is live and ready for content review."* SLICC runs git commands in the terminal (git add, commit, push visible). Then switches context — navigates Slack via browser automation, finds Sarah's thread, types a message with a link. All visible on screen.
+**Visual**: In Sliccstart, user clicks Slack — it launches with the SLICC overlay injected (ice cream logo visible in the sidebar). Then clicks VS Code — same thing. Quick shot: three windows on screen, all with SLICC.
 
-**Voiceover**:
-> Happy with it? Ship it. Git push, done. Then SLICC hops over to Slack and tells your teammate it's ready. One prompt, two apps, zero context switching.
+**User** (types, back in SLICC Chrome window):
+> OK, Slack and VS Code are connected. Both showing your panel.
+
+**SLICC** (chat):
+> I can see them both. Slack and VS Code are now part of this session. And here's your Hacker News roundup —
+
+**Visual**: SLICC drops an inline sprinkle — a compact card with the top HN stories, titles, points, comment counts. It was built while the user was connecting apps.
+
+**SLICC** (chat):
+> Built that while you were setting things up. Anything else?
 
 ---
 
-## Act 6 — Outro (1:50–2:00)
+## Act 4 — The Real Ask (1:15–1:45)
 
-**Visual**: Pull back to show the full desktop — Chrome with SLICC, Slack with overlay, VS Code with overlay. Fade to branded slide with logo, URL, and "npx sliccy" command.
+**User** (types):
+> Actually yeah — what's new in my Slack channels? Anything I should pay attention to today?
 
-**Voiceover**:
-> SLICC. One agent across all your apps. Try it now — npx sliccy.
+**Visual**: SLICC reads Slack via the connected tray session. Browses channels, reads recent messages. Comes back with a summary — either as text or a sprinkle card with channel highlights, mentions, and threads that need attention.
+
+**SLICC** (chat):
+> Here's what's going on. You've got 3 mentions in #dev — Sarah's asking about the deploy timeline. There's a thread in #design about the new landing page. And someone shared a PR in #code-review that touches your module.
+>
+> Want me to do anything about these?
+
+**User** (types):
+> Reply to Sarah — tell her we're on track, shipping the fix this afternoon.
+
+**Visual**: SLICC navigates Slack via browser automation, finds Sarah's message, types the reply. Visible on screen.
+
+**SLICC** (chat):
+> Done. Replied to Sarah in #dev.
+
+---
+
+## Act 5 — Outro (1:45–2:00)
+
+**Visual**: Pull back to show the full desktop — Chrome with SLICC (HN summary and Slack recap visible in chat), Slack with overlay (reply visible), VS Code with overlay. All connected through one session.
+
+**SLICC** (chat):
+> Three apps, one agent. Need anything else?
+
+**Visual**: Fade to branded slide — ice cream cone logo, "slicc" wordmark, `npx sliccy`, website URL.
 
 ---
 
 ## Production Notes
 
+### Dialog Delivery
+
+This is NOT a traditional voiceover. Two options:
+
+1. **Text only** — The chat bubbles ARE the dialog. No spoken audio. Lo-fi background music throughout. Clean, modern. Captions/subtitles for key moments.
+2. **Two voices** — SLICC gets an AI voice (ElevenLabs), user lines are either typed on screen or read by a second voice. More engaging but more production work.
+
+Recommend starting with option 1 (text only) — it's simpler to produce and the dialog reads well on screen.
+
 ### Screen Recordings Needed
 
 | Act | What to record | Key moments |
 |-----|---------------|-------------|
-| 1 | Sliccstart → Chrome launch | Workspace appearing with all panels |
-| 2 | Sliccstart → Slack attach, then VS Code attach | Overlay injection moment in each app |
-| 3 | Chat interaction + scoops spinning up | Parallel scoops visible, sprinkle card rendering |
-| 4 | Chat → terminal creates `blocks/news-headlines/` → JS/CSS written → preview tab with live news | File tree expanding, `fetch()` in code, real thumbnails loading in preview |
-| 5 | Git commands in terminal + Slack browser automation | Commit output, Slack message being typed with link |
-| 6 | Desktop pull-back shot | All three windows with SLICC visible |
+| 1 | Sliccstart → Chrome launch, welcome message | Workspace appearing, SLICC greeting |
+| 2 | SLICC opens HN tab + tray URL in chat | Background scoop working, URL displayed |
+| 3 | Sliccstart → Slack + VS Code attach, HN sprinkle appears | Overlay injection, sprinkle card rendering |
+| 4 | Slack channel reading + reply via browser automation | Slack summary, reply being typed live |
+| 5 | Desktop pull-back, all three windows | Connected session visible |
 
 ### Timing Budget
 
 | Act | Duration | Cumulative |
 |-----|----------|------------|
-| 0 — Intro | 5s | 0:05 |
-| 1 — Launch | 10s | 0:15 |
-| 2 — Connect | 20s | 0:35 |
-| 3 — Catch-Up | 25s | 1:00 |
-| 4 — Coding | 35s | 1:35 |
-| 5 — Action | 15s | 1:50 |
-| 6 — Outro | 10s | 2:00 |
+| 1 — Launch & Welcome | 20s | 0:20 |
+| 2 — Background + Tray | 30s | 0:50 |
+| 3 — Electron Apps | 25s | 1:15 |
+| 4 — Slack Ask | 30s | 1:45 |
+| 5 — Outro | 15s | 2:00 |
 
-### Voice
+### What Makes This Work
 
-- Casual, upbeat, not corporate. Think "developer showing a friend something cool."
-- ElevenLabs voice: **Eric** (smooth, trustworthy) or **Brian** (deep, resonant) — test both.
-- Pacing: ~2.5 words/sec. Each act's voiceover is calibrated to fit within its time window.
-
-### Music
-
-- Lo-fi/chill instrumental on intro + outro slides only.
-- No music during Acts 1–5 (voice + screen audio only).
-
-### Word Counts per Act (at ~2.5 words/sec)
-
-| Act | Duration for VO | Target words | Actual words |
-|-----|----------------|--------------|--------------|
-| 0 | 5s | ~12 | 14 |
-| 1 | 10s | ~25 | 30 |
-| 2 | 18s | ~45 | 48 |
-| 3 | 22s | ~55 | 52 |
-| 4 | 30s | ~75 | 68 |
-| 5 | 13s | ~32 | 28 |
-| 6 | 8s | ~20 | 14 |
+- **Dialog-driven** — feels like watching someone use the product, not a marketing pitch
+- **SLICC has personality** — it talks casually, offers to help, works in the background without being asked to wait
+- **Parallel work is shown, not explained** — HN summary builds while user does something else
+- **The escalation is natural** — open a tab → connect apps → read Slack → take action
+- **No coding in this version** — keeps it accessible. Coding demo can be a separate video
