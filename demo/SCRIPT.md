@@ -40,21 +40,30 @@
 
 ---
 
-## Act 4 — Real Coding: AEM Edge Delivery (1:00–1:35)
+## Act 4 — Real Coding: AEM Edge Delivery News Block (1:00–1:35)
 
-**Visual**: User types: *"I need a new hero block for our Edge Delivery site. It should have a full-bleed background image, headline, subhead, and a CTA button. Follow the EDS block pattern."* SLICC works in the terminal — creates the block folder, writes the CSS and JS files following EDS conventions (block name folder, auto-loaded CSS/JS). Shows the files being created in the file panel. Then SLICC runs a preview — opens a new browser tab showing the rendered block on a local EDS page.
+**Visual**: User types: *"Our Edge Delivery site needs a live news feed. Build me a news-headlines block that fetches from a public news API and displays articles with thumbnails, titles, and publish dates. Follow the EDS block conventions."*
+
+SLICC works — visible in both terminal and file panel:
+1. Creates `blocks/news-headlines/` folder
+2. Writes `news-headlines.js` — fetches from a public news API (e.g. GNews, NewsData.io), parses the JSON, renders article cards with thumbnail, headline, source, and date
+3. Writes `news-headlines.css` — responsive card grid layout, thumbnail styling, hover states
+4. Shows the code briefly in the file panel (audience sees real EDS-pattern code: `export default async function decorate(block)`)
+5. SLICC opens a browser preview tab — the block renders with live headlines and images pulled from the API
+
+**Key on-screen moments**: The file tree expanding with the new folder. The JS `fetch()` call visible in code. The preview loading with real news thumbnails.
 
 **Voiceover**:
-> Now the real stuff. We ask SLICC to build a hero block for an AEM Edge Delivery site. It knows the pattern — creates the folder, writes the CSS and JavaScript, all following EDS conventions. Then it previews the result right in the browser. The same browser it's running in. No switching windows, no copy-pasting between tools.
+> Now the real stuff. This Edge Delivery site has no news section — let's add one. SLICC builds a news-headlines block from scratch — fetches from a live API, renders a card grid with thumbnails, all following EDS conventions. And it previews the result right in the browser it's running in. Real articles, real data, real code — in about thirty seconds.
 
 ---
 
-## Act 5 — Take Action (1:35–1:50)
+## Act 5 — Ship It (1:35–1:50)
 
-**Visual**: User types: *"Commit this and push it, then reply to Sarah on Slack — tell her the hero block is ready for review."* SLICC runs git commands in the terminal (git add, commit, push visible). Then switches context — navigates Slack via browser automation, finds Sarah's message, types a reply. All visible on screen.
+**Visual**: User types: *"Looks good. Commit and push this, then let Sarah know on Slack that the news block is live and ready for content review."* SLICC runs git commands in the terminal (git add, commit, push visible). Then switches context — navigates Slack via browser automation, finds Sarah's thread, types a message with a link. All visible on screen.
 
 **Voiceover**:
-> SLICC doesn't just write code — it ships it. Git commit, push, done. Then it hops over to Slack and sends a message. One prompt, two apps, zero context switching.
+> Happy with it? Ship it. Git push, done. Then SLICC hops over to Slack and tells your teammate it's ready. One prompt, two apps, zero context switching.
 
 ---
 
@@ -76,8 +85,8 @@
 | 1 | Sliccstart → Chrome launch | Workspace appearing with all panels |
 | 2 | Sliccstart → Slack attach, then VS Code attach | Overlay injection moment in each app |
 | 3 | Chat interaction + scoops spinning up | Parallel scoops visible, sprinkle card rendering |
-| 4 | Chat → terminal activity → file creation → browser preview | EDS block code in terminal, preview tab opening |
-| 5 | Git commands in terminal + Slack browser automation | Commit output, Slack message being typed |
+| 4 | Chat → terminal creates `blocks/news-headlines/` → JS/CSS written → preview tab with live news | File tree expanding, `fetch()` in code, real thumbnails loading in preview |
+| 5 | Git commands in terminal + Slack browser automation | Commit output, Slack message being typed with link |
 | 6 | Desktop pull-back shot | All three windows with SLICC visible |
 
 ### Timing Budget
@@ -111,6 +120,6 @@
 | 1 | 10s | ~25 | 30 |
 | 2 | 18s | ~45 | 48 |
 | 3 | 22s | ~55 | 52 |
-| 4 | 30s | ~75 | 72 |
-| 5 | 13s | ~32 | 30 |
+| 4 | 30s | ~75 | 68 |
+| 5 | 13s | ~32 | 28 |
 | 6 | 8s | ~20 | 14 |
