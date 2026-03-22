@@ -14,24 +14,24 @@ The demo is a conversation. SLICC introduces itself, the user jumps in with real
 > Hey! I'm SLICC — I run right here in your browser. I've got a shell, a filesystem, browser automation, and I can spin up sub-agents when things get busy. What are we working on?
 
 **User** (types):
-> First, can you open a tab and check what's trending on Hacker News? I want to see what's going on while we set things up.
+> Can you run an SEO audit and an accessibility report on aem.live? Do them in parallel, I want both ready when I'm back.
 
 ---
 
-## Act 2 — Background Work + Tray Setup (0:20–0:50)
+## Act 2 — Parallel Scoops + Tray Setup (0:20–0:50)
 
-**Visual**: SLICC opens a new browser tab, navigates to Hacker News, starts summarizing. Meanwhile the user keeps chatting — SLICC is doing work in the background (visible in terminal/scoop panel).
+**Visual**: SLICC spins up two scoops — visible in the scoop panel as two separate agents working simultaneously. One is labeled "SEO Audit", the other "Accessibility Report". Both are actively working (terminal output scrolling, browser tabs opening aem.live). The scoop panel shows both running at the same time.
 
 **SLICC** (chat):
-> On it — I'll grab the front page and pull together a summary. What else?
+> Spinning up two scoops — one for SEO, one for accessibility. They'll run in parallel. What else while we wait?
 
 **User** (types):
 > I want to connect a couple of desktop apps too. Can you give me the tray join URL so I can onboard Slack and VS Code?
 
 **SLICC** (chat):
-> Sure, here's your tray URL: `https://tray.slicc.dev/join/xxxxx`. Any app that connects to this can be part of our session. I'll keep working on the HN summary while you set that up.
+> Sure, here's your tray URL: `https://tray.slicc.dev/join/xxxxx`. Any app that connects to this can be part of our session. The scoops are still working — I'll let you know when they're done.
 
-**Visual**: SLICC shows the tray URL. Meanwhile in the background, the HN summary is being built — visible as a scoop working. User switches to Sliccstart.
+**Visual**: SLICC shows the tray URL. The two scoops keep working in the background — visible activity in the scoop panel. User switches to Sliccstart.
 
 ---
 
@@ -43,12 +43,14 @@ The demo is a conversation. SLICC introduces itself, the user jumps in with real
 > OK, Slack and VS Code are connected. Both showing your panel.
 
 **SLICC** (chat):
-> I can see them both. Slack and VS Code are now part of this session. And here's your Hacker News roundup —
+> I can see them both. Slack and VS Code are now part of this session. Oh, and the scoops just finished —
 
-**Visual**: SLICC drops an inline sprinkle — a compact card with the top HN stories, titles, points, comment counts. It was built while the user was connecting apps.
+**Visual**: The two scoops complete. SLICC drops two inline sprinkles — side by side or stacked. The SEO report shows a score, issues found (missing meta descriptions, image alt tags, heading hierarchy). The accessibility report shows WCAG violations, contrast issues, missing ARIA labels, with severity badges.
 
 **SLICC** (chat):
-> Built that while you were setting things up. Anything else?
+> SEO audit found 12 issues — biggest ones are missing meta descriptions on 3 pages and some images without alt text. Accessibility report flagged 8 WCAG violations, mostly contrast ratios and missing ARIA labels. Both reports are here if you want to dig in.
+>
+> Those ran while you were connecting apps. What's next?
 
 ---
 
@@ -76,7 +78,7 @@ The demo is a conversation. SLICC introduces itself, the user jumps in with real
 
 ## Act 5 — Outro (1:45–2:00)
 
-**Visual**: Pull back to show the full desktop — Chrome with SLICC (HN summary and Slack recap visible in chat), Slack with overlay (reply visible), VS Code with overlay. All connected through one session.
+**Visual**: Pull back to show the full desktop — Chrome with SLICC (SEO/a11y reports and Slack recap visible in chat), Slack with overlay (reply visible), VS Code with overlay. All connected through one session.
 
 **SLICC** (chat):
 > Three apps, one agent. Need anything else?
@@ -101,8 +103,8 @@ Recommend starting with option 1 (text only) — it's simpler to produce and the
 | Act | What to record | Key moments |
 |-----|---------------|-------------|
 | 1 | Sliccstart → Chrome launch, welcome message | Workspace appearing, SLICC greeting |
-| 2 | SLICC opens HN tab + tray URL in chat | Background scoop working, URL displayed |
-| 3 | Sliccstart → Slack + VS Code attach, HN sprinkle appears | Overlay injection, sprinkle card rendering |
+| 2 | Two scoops spinning up + tray URL in chat | Both scoops visible working in parallel, URL displayed |
+| 3 | Sliccstart → Slack + VS Code attach, SEO/a11y reports land | Overlay injection, two sprinkle report cards rendering |
 | 4 | Slack channel reading + reply via browser automation | Slack summary, reply being typed live |
 | 5 | Desktop pull-back, all three windows | Connected session visible |
 
@@ -120,6 +122,6 @@ Recommend starting with option 1 (text only) — it's simpler to produce and the
 
 - **Dialog-driven** — feels like watching someone use the product, not a marketing pitch
 - **SLICC has personality** — it talks casually, offers to help, works in the background without being asked to wait
-- **Parallel work is shown, not explained** — HN summary builds while user does something else
-- **The escalation is natural** — open a tab → connect apps → read Slack → take action
-- **No coding in this version** — keeps it accessible. Coding demo can be a separate video
+- **Parallel work is shown, not explained** — two scoops run SEO + a11y audits while user connects apps
+- **The escalation is natural** — launch → parallel audits → connect apps → read Slack → take action
+- **Real deliverables** — SEO and accessibility reports are genuinely useful output, not a toy demo
