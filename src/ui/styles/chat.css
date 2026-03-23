@@ -400,6 +400,41 @@
   50% { transform: scale(1.06); opacity: 0.85; }
 }
 
+/* Voice dialog button */
+.chat__dialog-btn {
+  width: 32px; height: 32px; border: none;
+  border-radius: var(--s2-radius-default);
+  background: transparent;
+  color: var(--s2-content-secondary);
+  font-size: 16px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: background var(--s2-transition-default), color var(--s2-transition-default);
+}
+.chat__dialog-btn svg { width: 20px; height: 20px; }
+.chat__dialog-btn:hover {
+  background: var(--s2-bg-elevated);
+  color: var(--s2-content-default);
+}
+.chat__dialog-btn--active {
+  background: var(--s2-bg-elevated); color: #7b68ee; border: 1px solid #7b68ee;
+}
+.chat__dialog-btn--listening {
+  background: #7b68ee; color: #fff; border: none;
+}
+.chat__dialog-btn--speaking {
+  background: #7b68ee; color: #fff; border: none;
+  animation: dialog-speak 1s ease-in-out infinite;
+}
+.chat__dialog-btn--filling {
+  background: #5a4fcf; color: #fff; border: none;
+  animation: dialog-speak 0.8s ease-in-out infinite;
+}
+@keyframes dialog-speak {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+}
+
 /* ================================================================== */
 /* UXC Feedback Row — icon buttons below assistant messages            */
 /* ================================================================== */

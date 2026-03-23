@@ -28,6 +28,8 @@ import {
   setSelectedModelId,
   getProviderConfig,
 } from './provider-settings.js';
+import { VoiceDialog, loadVoiceDialogConfig, VOICE_DIALOG_KEYS } from './voice-dialog/index.js';
+import type { VoiceDialogState } from './voice-dialog/index.js';
 
 const log = createLogger('chat-panel');
 
@@ -75,6 +77,9 @@ export class ChatPanel {
   private micBtn!: HTMLButtonElement;
   private voiceInput: VoiceInput | null = null;
   private voiceMode = false;
+  private voiceDialog: VoiceDialog | null = null;
+  private voiceDialogMode = false;
+  private dialogBtn!: HTMLButtonElement;
   private keydownListener: ((e: KeyboardEvent) => void) | null = null;
   private messages: ChatMessage[] = [];
   private agent: AgentHandle | null = null;
@@ -364,6 +369,28 @@ export class ChatPanel {
     this.micBtn.appendChild(svg);
     this.micBtn.dataset.tooltip = 'Voice (Ctrl+Shift+V)';
 
+    // Voice dialog button (headphones icon)
+    this.dialogBtn = document.createElement('button');
+    this.dialogBtn.className = 'chat__dialog-btn';
+    const dialogSvg = document.createElementNS(svgNs, 'svg');
+    dialogSvg.setAttribute('width', '16');
+    dialogSvg.setAttribute('height', '16');
+    dialogSvg.setAttribute('viewBox', '0 0 24 24');
+    dialogSvg.setAttribute('fill', 'none');
+    dialogSvg.setAttribute('stroke', 'currentColor');
+    dialogSvg.setAttribute('stroke-width', '2');
+    dialogSvg.setAttribute('stroke-linecap', 'round');
+    dialogSvg.setAttribute('stroke-linejoin', 'round');
+    const headPath = document.createElementNS(svgNs, 'path');
+    headPath.setAttribute('d', 'M3 18v-6a9 9 0 0 1 18 0v6');
+    const leftEar = document.createElementNS(svgNs, 'path');
+    leftEar.setAttribute('d', 'M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z');
+    const rightEar = document.createElementNS(svgNs, 'path');
+    rightEar.setAttribute('d', 'M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z');
+    dialogSvg.append(headPath, leftEar, rightEar);
+    this.dialogBtn.appendChild(dialogSvg);
+    this.dialogBtn.title = 'Voice dialog (Ctrl+Shift+D)';
+
     // Input wrapper — two-row layout per Figma PromptBar
     const inputWrapper = document.createElement('div');
     inputWrapper.className = 'chat__input-wrapper';
@@ -378,6 +405,7 @@ export class ChatPanel {
     const actionBarLeft = document.createElement('div');
     actionBarLeft.className = 'chat__action-bar-left';
     actionBarLeft.appendChild(this.micBtn);
+    actionBarLeft.appendChild(this.dialogBtn);
     actionBar.appendChild(actionBarLeft);
 
     // Model selector — between left actions and send button
@@ -482,11 +510,20 @@ export class ChatPanel {
       this.toggleVoiceMode();
     });
 
-    // Keyboard shortcut: Ctrl+Shift+V / Cmd+Shift+V
+    this.dialogBtn.addEventListener('click', () => {
+      this.toggleVoiceDialogMode();
+    });
+
+    // Keyboard shortcuts: Ctrl+Shift+V (voice input), Ctrl+Shift+D (voice dialog)
     this.keydownListener = (e) => {
-      if (e.shiftKey && (e.ctrlKey || e.metaKey) && e.key === 'V') {
-        e.preventDefault();
-        this.toggleVoiceMode();
+      if (e.shiftKey && (e.ctrlKey || e.metaKey)) {
+        if (e.key === 'V') {
+          e.preventDefault();
+          this.toggleVoiceMode();
+        } else if (e.key === 'D') {
+          e.preventDefault();
+          this.toggleVoiceDialogMode();
+        }
       }
     };
     document.addEventListener('keydown', this.keydownListener);
@@ -500,6 +537,78 @@ export class ChatPanel {
     } else {
       this.voiceInput?.stop();
     }
+  }
+
+  private toggleVoiceDialogMode(): void {
+    this.voiceDialogMode = !this.voiceDialogMode;
+
+    if (this.voiceDialogMode) {
+      const config = loadVoiceDialogConfig({
+        onStateChange: (state) => this.updateDialogButtonState(state),
+        onTranscript: (text, isFinal) => {
+          this.textarea.value = text;
+          this.textarea.style.height = 'auto';
+          this.textarea.style.height = Math.min(this.textarea.scrollHeight, 120) + 'px';
+        },
+        onTTSText: (_text) => {
+          // Could show spoken text in UI if desired
+        },
+        onError: (error) => {
+          log.debug('Voice dialog error', { error });
+          this.addSystemMessage(error);
+        },
+      });
+
+      if (!config) {
+        this.voiceDialogMode = false;
+        this.addSystemMessage('Voice dialog requires an ElevenLabs API key. Set it in localStorage key "voice-dialog-tts-key".');
+        return;
+      }
+
+      // Disable regular voice mode if active
+      if (this.voiceMode) {
+        this.voiceMode = false;
+        this.micBtn.classList.remove('chat__mic-btn--active', 'chat__mic-btn--listening');
+        this.voiceInput?.stop();
+      }
+
+      this.voiceDialog = new VoiceDialog(config);
+      this.voiceDialog.start();
+      this.updateDialogButtonState('LISTENING');
+    } else {
+      this.voiceDialog?.stop();
+      this.voiceDialog = null;
+      this.updateDialogButtonState('IDLE');
+    }
+  }
+
+  private updateDialogButtonState(state: VoiceDialogState): void {
+    this.dialogBtn.classList.remove(
+      'chat__dialog-btn--active',
+      'chat__dialog-btn--listening',
+      'chat__dialog-btn--speaking',
+      'chat__dialog-btn--filling',
+    );
+
+    switch (state) {
+      case 'LISTENING':
+        this.dialogBtn.classList.add('chat__dialog-btn--active', 'chat__dialog-btn--listening');
+        break;
+      case 'FILLING':
+        this.dialogBtn.classList.add('chat__dialog-btn--active', 'chat__dialog-btn--filling');
+        break;
+      case 'SPEAKING':
+        this.dialogBtn.classList.add('chat__dialog-btn--active', 'chat__dialog-btn--speaking');
+        break;
+      case 'IDLE':
+      default:
+        break;
+    }
+  }
+
+  /** Get the VoiceDialog instance (for wiring tool events from main.ts). */
+  getVoiceDialog(): VoiceDialog | null {
+    return this.voiceDialog;
   }
 
   private sendMessage(): void {
@@ -535,6 +644,9 @@ export class ChatPanel {
 
     // Send to agent (orchestrator persists & queues if the cone is busy)
     this.agent?.sendMessage(text, msg.id);
+
+    // Notify voice dialog (starts filler immediately)
+    this.voiceDialog?.onUserMessage(text);
   }
 
   private handleAgentEvent(event: AgentEvent): void {
@@ -598,6 +710,9 @@ export class ChatPanel {
     if (this.streamingRafId === null) {
       this.streamingRafId = requestAnimationFrame(() => this.flushPendingDelta());
     }
+
+    // Feed streaming tokens to voice dialog for TTS
+    this.voiceDialog?.feedToken(text);
   }
 
   private handleContentDone(messageId: string): void {
@@ -622,6 +737,11 @@ export class ChatPanel {
       input: toolInput,
     });
     this.updateMessageEl(messageId);
+
+    // Feed tool start to voice dialog filler
+    if (this.voiceDialog && typeof toolInput === 'object' && toolInput !== null) {
+      this.voiceDialog.feedToolStart(toolName, toolInput as Record<string, unknown>);
+    }
   }
 
   private handleToolResult(
@@ -647,6 +767,10 @@ export class ChatPanel {
       tc.isError = isError;
     }
     this.updateMessageEl(messageId);
+
+    // Feed tool result to voice dialog filler
+    const summary = result.length > 100 ? result.slice(0, 100) + '...' : result;
+    this.voiceDialog?.feedToolResult(toolName, summary);
   }
 
   private handleToolUI(
@@ -739,6 +863,9 @@ export class ChatPanel {
     this.setStreamingState(false);
     this.currentStreamId = null;
     this.persistSession();
+
+    // Signal voice dialog that the response is complete
+    this.voiceDialog?.endResponse();
   }
 
   private handleError(error: string): void {
@@ -1380,6 +1507,8 @@ export class ChatPanel {
     this.disposeAllInlineSprinkles();
     this.unsubscribe?.();
     this.voiceInput?.destroy();
+    this.voiceDialog?.stop();
+    this.voiceDialog = null;
     if (this.keydownListener) {
       document.removeEventListener('keydown', this.keydownListener);
       this.keydownListener = null;
