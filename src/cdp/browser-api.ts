@@ -16,16 +16,69 @@ import type {
   BoundingBox,
   AccessibilityNode,
 } from './types.js';
+import type { TrayTargetEntry } from '../scoops/tray-sync-protocol.js';
+import { normalizeAccessibilityText } from './normalize-accessibility-text.js';
+import { createLogger } from '../core/logger.js';
 
-const DEFAULT_CDP_URL = 'ws://localhost:3000/cdp';
+/**
+ * Provider of remote tray targets and transport factory.
+ * Set via `setTrayTargetProvider()` to enable remote target support.
+ */
+export interface TrayTargetProvider {
+  getTargets(): TrayTargetEntry[];
+  createRemoteTransport?(runtimeId: string, localTargetId: string): CDPTransport;
+  removeRemoteTransport?(runtimeId: string, localTargetId: string): void;
+  /** Open a new tab on a remote runtime. Returns the composite targetId. */
+  openRemoteTab?(runtimeId: string, url: string): Promise<string>;
+}
+
+const FALLBACK_CDP_URL = 'ws://localhost:5710/cdp';
+const log = createLogger('browser-api');
+
+export function getDefaultCdpUrl(
+  locationLike: Pick<Location, 'protocol' | 'host'> | null = typeof window !== 'undefined'
+    ? window.location
+    : null
+): string {
+  if (!locationLike?.host) return FALLBACK_CDP_URL;
+  const protocol = locationLike.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${locationLike.host}/cdp`;
+}
 
 export class BrowserAPI {
   private client: CDPTransport;
+  private localClient: CDPTransport; // preserved original when using remote transport
   private sessionId: string | null = null;
   private attachedTargetId: string | null = null;
+  private trayTargetProvider: TrayTargetProvider | null = null;
+  private remoteTargetInfo: { runtimeId: string; localTargetId: string } | null = null;
+  private readonly handleJavaScriptDialogOpening = async (
+    params: Record<string, unknown>
+  ): Promise<void> => {
+    const sessionId =
+      typeof params['sessionId'] === 'string' ? (params['sessionId'] as string) : this.sessionId;
+    if (!sessionId) return;
+
+    try {
+      await this.client.send('Page.handleJavaScriptDialog', { accept: false }, sessionId, 5000);
+      log.warn('Auto-dismissed unexpected JavaScript dialog', {
+        sessionId,
+        type: params['type'],
+        message: params['message'],
+        url: params['url'],
+      });
+    } catch (error) {
+      log.warn('Failed to auto-dismiss JavaScript dialog', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
 
   constructor(client?: CDPTransport) {
     this.client = client ?? new CDPClient();
+    this.localClient = this.client;
+    this.addDialogListener(this.client);
   }
 
   /**
@@ -51,12 +104,43 @@ export class BrowserAPI {
   }
 
   /**
+   * Set a provider of remote tray targets.
+   * When set, listAllTargets() includes remote targets and attachToPage()
+   * can attach to remote targets using the "{runtimeId}:{localTargetId}" format.
+   */
+  setTrayTargetProvider(provider: TrayTargetProvider | null): void {
+    this.trayTargetProvider = provider;
+  }
+
+  /**
+   * List all pages — local + remote tray targets.
+   * Remote targets have targetId format "{runtimeId}:{localTargetId}".
+   * Deduplicates by excluding registry entries whose tray-wide targetId matches a local page.
+   */
+  async listAllTargets(): Promise<PageInfo[]> {
+    const local = await this.listPages();
+    if (!this.trayTargetProvider) return local;
+
+    const localIds = new Set(local.map((p) => p.targetId));
+    const remoteEntries = this.trayTargetProvider.getTargets();
+    const remote: PageInfo[] = remoteEntries
+      .filter((t) => !localIds.has(t.targetId))
+      .map((t) => ({
+        targetId: t.targetId,
+        title: t.title,
+        url: t.url,
+      }));
+
+    return [...local, ...remote];
+  }
+
+  /**
    * Connect to the CDP proxy.
    * DebuggerClient (extension mode) accepts but ignores these options.
    */
   async connect(options?: Partial<CDPConnectOptions>): Promise<void> {
     await this.client.connect({
-      url: options?.url ?? DEFAULT_CDP_URL,
+      url: options?.url ?? getDefaultCdpUrl(),
       timeout: options?.timeout,
     });
   }
@@ -73,6 +157,67 @@ export class BrowserAPI {
       background: true,
     });
     return result['targetId'] as string;
+  }
+
+  /**
+   * Create a new tab on a remote runtime within the tray.
+   * Requires a tray target provider with openRemoteTab support.
+   * Returns the composite targetId ("{runtimeId}:{localTargetId}").
+   */
+  async createRemotePage(runtimeId: string, url?: string): Promise<string> {
+    if (!this.trayTargetProvider?.openRemoteTab) {
+      throw new Error('Remote tab opening not available (no tray target provider)');
+    }
+    return this.trayTargetProvider.openRemoteTab(runtimeId, url ?? 'about:blank');
+  }
+
+  /**
+   * Close a browser tab/target by its targetId.
+   * Handles remote tray targets by routing through RemoteCDPTransport.
+   */
+  async closePage(targetId: string): Promise<void> {
+    await this.ensureConnected();
+
+    // Check if this is a remote tray target (format: "runtimeId:localTargetId")
+    if (this.trayTargetProvider?.createRemoteTransport && targetId.includes(':')) {
+      const colonIdx = targetId.indexOf(':');
+      const runtimeId = targetId.substring(0, colonIdx);
+      const localTargetId = targetId.substring(colonIdx + 1);
+
+      // Trust the runtimeId:localTargetId format — don't require registry confirmation.
+      {
+        const remoteTransport = this.trayTargetProvider.createRemoteTransport(
+          runtimeId,
+          localTargetId
+        );
+        try {
+          await remoteTransport.send('Target.closeTarget', { targetId: localTargetId });
+        } finally {
+          if (this.trayTargetProvider.removeRemoteTransport) {
+            this.trayTargetProvider.removeRemoteTransport(runtimeId, localTargetId);
+          }
+        }
+
+        // If we were attached to the target being closed, clean up
+        if (this.attachedTargetId === targetId) {
+          if (this.remoteTargetInfo) {
+            this.setClient(this.localClient);
+            this.remoteTargetInfo = null;
+          }
+          this.sessionId = null;
+          this.attachedTargetId = null;
+        }
+        return;
+      }
+    }
+
+    await this.localClient.send('Target.closeTarget', { targetId });
+
+    // Clean up if we were attached to this target
+    if (this.attachedTargetId === targetId) {
+      this.sessionId = null;
+      this.attachedTargetId = null;
+    }
   }
 
   /**
@@ -104,6 +249,9 @@ export class BrowserAPI {
   /**
    * Attach to a specific page target, enabling page-level commands.
    * Returns the CDP session ID for the attached target.
+   *
+   * If the targetId contains a colon (format "{runtimeId}:{localTargetId}"),
+   * it's treated as a remote tray target and a RemoteCDPTransport is used.
    */
   async attachToPage(targetId: string): Promise<string> {
     await this.ensureConnected();
@@ -112,17 +260,50 @@ export class BrowserAPI {
       await this.detach();
     }
 
+    // Check if this is a remote tray target (format: "runtimeId:localTargetId")
+    if (this.trayTargetProvider?.createRemoteTransport && targetId.includes(':')) {
+      const colonIdx = targetId.indexOf(':');
+      const runtimeId = targetId.substring(0, colonIdx);
+      const localTargetId = targetId.substring(colonIdx + 1);
+
+      // The runtimeId:localTargetId format is a strong signal this is remote.
+      // Don't require registry confirmation — the target may have just been
+      // created via createRemotePage() and not yet advertised.
+      {
+        const remoteTransport = this.trayTargetProvider.createRemoteTransport(
+          runtimeId,
+          localTargetId
+        );
+        this.setClient(remoteTransport);
+        this.remoteTargetInfo = { runtimeId, localTargetId };
+
+        // Send attachToTarget via the remote transport
+        const result = await this.client.send('Target.attachToTarget', {
+          targetId: localTargetId,
+          flatten: true,
+        });
+        this.sessionId = result['sessionId'] as string;
+        this.attachedTargetId = targetId;
+        await this.client.send('Page.enable', {}, this.sessionId);
+        return this.sessionId;
+      }
+    }
+
     const result = await this.client.send('Target.attachToTarget', {
       targetId,
       flatten: true,
     });
     this.sessionId = result['sessionId'] as string;
     this.attachedTargetId = targetId;
+    // Keep Page events available so unexpected dialogs can be auto-dismissed
+    // before they stall the current CDP command.
+    await this.client.send('Page.enable', {}, this.sessionId);
     return this.sessionId;
   }
 
   /**
    * Detach from the currently attached target.
+   * If attached to a remote target, restores the local transport.
    */
   async detach(): Promise<void> {
     if (this.sessionId) {
@@ -133,6 +314,17 @@ export class BrowserAPI {
       } catch {
         // Target may already be detached
       }
+
+      // Restore local transport if we were using a remote one
+      if (this.remoteTargetInfo && this.trayTargetProvider?.removeRemoteTransport) {
+        this.trayTargetProvider.removeRemoteTransport(
+          this.remoteTargetInfo.runtimeId,
+          this.remoteTargetInfo.localTargetId
+        );
+        this.setClient(this.localClient);
+        this.remoteTargetInfo = null;
+      }
+
       this.sessionId = null;
       this.attachedTargetId = null;
     }
@@ -164,54 +356,105 @@ export class BrowserAPI {
     quality?: number;
     fullPage?: boolean;
     clip?: { x: number; y: number; width: number; height: number; scale?: number };
+    maxWidth?: number;
   }): Promise<string> {
     await this.ensureConnected();
     this.ensureAttached();
 
-    const params: Record<string, unknown> = {
-      format: options?.format ?? 'png',
-    };
-    if (options?.quality !== undefined) params['quality'] = options.quality;
-    if (options?.clip) {
-      params['clip'] = { ...options.clip, scale: options.clip.scale ?? 1 };
-      params['captureBeyondViewport'] = true;
-    } else if (options?.fullPage) {
-      // Get full page metrics for a full-page screenshot
-      const metrics = await this.client.send(
-        'Page.getLayoutMetrics',
-        {},
-        this.sessionId!,
-      );
-      const contentSize = metrics['contentSize'] as {
-        width: number;
-        height: number;
+    try {
+      const params: Record<string, unknown> = {
+        format: options?.format ?? 'png',
+        captureBeyondViewport: true,
       };
-      params['clip'] = {
-        x: 0,
-        y: 0,
-        width: contentSize.width,
-        height: contentSize.height,
-        scale: 1,
-      };
-      params['captureBeyondViewport'] = true;
-    }
+      if (options?.quality !== undefined) params['quality'] = options.quality;
 
-    const result = await this.client.send(
-      'Page.captureScreenshot',
-      params,
-      this.sessionId!,
-    );
-    return result['data'] as string;
+      if (options?.clip || options?.fullPage) {
+        // Get CSS dimensions for full-page clip
+        let cssWidth = 0;
+        let cssScrollHeight = 0;
+        try {
+          await this.client.send('Runtime.enable', {}, this.sessionId!);
+          const evalResult = await this.client.send(
+            'Runtime.evaluate',
+            {
+              expression:
+                'JSON.stringify({ w: window.innerWidth, h: document.documentElement.scrollHeight })',
+              returnByValue: true,
+            },
+            this.sessionId!
+          );
+          const val = JSON.parse((evalResult['result'] as { value?: string })?.value ?? '{}');
+          cssWidth = val.w ?? 0;
+          cssScrollHeight = val.h ?? 0;
+        } catch {
+          // Best-effort
+        }
+
+        if (options?.clip) {
+          params['clip'] = { ...options.clip, scale: options.clip.scale ?? 1 };
+        } else {
+          // Full-page: CSS viewport width + CSS scroll height
+          params['clip'] = {
+            x: 0,
+            y: 0,
+            width: cssWidth || 1280,
+            height: cssScrollHeight || 800,
+            scale: 1,
+          };
+        }
+      }
+      // No clip/fullPage = viewport screenshot (Chrome's default behavior)
+
+      const result = await this.client.send('Page.captureScreenshot', params, this.sessionId!);
+      let base64 = result['data'] as string;
+
+      // Post-capture resize via ImageMagick WASM if image exceeds maxWidth.
+      // Same engine as image-processor.ts for consistency.
+      if (options?.maxWidth) {
+        try {
+          const { getMagick } = await import('../shell/supplemental-commands/magick-wasm.js');
+          const magick = await getMagick();
+
+          const binaryStr = atob(base64);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+          const MAX_DIM = 8000;
+          let resized = false;
+          await magick.ImageMagick.read(bytes, async (img) => {
+            const targetWidth = Math.min(options.maxWidth!, MAX_DIM);
+            const longEdge = Math.max(img.width, img.height);
+            if (img.width > targetWidth || longEdge > MAX_DIM) {
+              const scale = Math.min(targetWidth / img.width, MAX_DIM / longEdge);
+              img.resize(Math.round(img.width * scale), Math.round(img.height * scale));
+              resized = true;
+            }
+            if (resized) {
+              img.write('PNG', (data: Uint8Array) => {
+                let bin = '';
+                for (let i = 0; i < data.length; i++) bin += String.fromCharCode(data[i]);
+                base64 = btoa(bin);
+              });
+            }
+          });
+        } catch (resizeErr) {
+          console.warn(
+            '[browser-api] Screenshot maxWidth resize failed, returning original',
+            resizeErr
+          );
+        }
+      }
+
+      return base64;
+    } finally {
+    }
   }
 
   /**
    * Evaluate a JavaScript expression in the attached page.
    * Returns the result value.
    */
-  async evaluate(
-    expression: string,
-    options?: EvaluateOptions,
-  ): Promise<unknown> {
+  async evaluate(expression: string, options?: EvaluateOptions): Promise<unknown> {
     await this.ensureConnected();
     this.ensureAttached();
 
@@ -224,15 +467,14 @@ export class BrowserAPI {
         awaitPromise: options?.awaitPromise ?? true,
         returnByValue: options?.returnByValue ?? true,
       },
-      this.sessionId!,
+      this.sessionId!
     );
 
     const exceptionDetails = result['exceptionDetails'] as
       | { text: string; exception?: { description?: string } }
       | undefined;
     if (exceptionDetails) {
-      const msg =
-        exceptionDetails.exception?.description ?? exceptionDetails.text;
+      const msg = exceptionDetails.exception?.description ?? exceptionDetails.text;
       throw new Error(`Evaluation failed: ${msg}`);
     }
 
@@ -262,12 +504,12 @@ export class BrowserAPI {
     await this.client.send(
       'Input.dispatchMouseEvent',
       { type: 'mousePressed', x, y, button: 'left', clickCount: 1 },
-      this.sessionId!,
+      this.sessionId!
     );
     await this.client.send(
       'Input.dispatchMouseEvent',
       { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 },
-      this.sessionId!,
+      this.sessionId!
     );
   }
 
@@ -282,12 +524,12 @@ export class BrowserAPI {
       await this.client.send(
         'Input.dispatchKeyEvent',
         { type: 'keyDown', text: char },
-        this.sessionId!,
+        this.sessionId!
       );
       await this.client.send(
         'Input.dispatchKeyEvent',
         { type: 'keyUp', text: char },
-        this.sessionId!,
+        this.sessionId!
       );
     }
   }
@@ -295,10 +537,7 @@ export class BrowserAPI {
   /**
    * Wait for a CSS selector to appear in the DOM.
    */
-  async waitForSelector(
-    selector: string,
-    options?: WaitForSelectorOptions,
-  ): Promise<void> {
+  async waitForSelector(selector: string, options?: WaitForSelectorOptions): Promise<void> {
     await this.ensureConnected();
     this.ensureAttached();
 
@@ -307,16 +546,12 @@ export class BrowserAPI {
     const start = Date.now();
 
     while (Date.now() - start < timeout) {
-      const found = await this.evaluate(
-        `!!document.querySelector(${JSON.stringify(selector)})`,
-      );
+      const found = await this.evaluate(`!!document.querySelector(${JSON.stringify(selector)})`);
       if (found) return;
       await new Promise((r) => setTimeout(r, interval));
     }
 
-    throw new Error(
-      `waitForSelector timed out after ${timeout}ms: ${selector}`,
-    );
+    throw new Error(`waitForSelector timed out after ${timeout}ms: ${selector}`);
   }
 
   /**
@@ -328,18 +563,15 @@ export class BrowserAPI {
 
     await this.client.send('Accessibility.enable', {}, this.sessionId!);
 
-    const result = await this.client.send(
-      'Accessibility.getFullAXTree',
-      {},
-      this.sessionId!,
-    );
+    const result = await this.client.send('Accessibility.getFullAXTree', {}, this.sessionId!);
 
     const nodes = result['nodes'] as Array<{
       nodeId: string;
-      role: { value: string };
-      name: { value: string };
-      description?: { value: string };
-      value?: { value: string };
+      backendDOMNodeId?: number;
+      role: { value: unknown };
+      name: { value: unknown };
+      description?: { value: unknown };
+      value?: { value: unknown };
       parentId?: string;
       childIds?: string[];
     }>;
@@ -353,12 +585,15 @@ export class BrowserAPI {
     let rootId: string | undefined;
 
     for (const n of nodes) {
+      const value = normalizeAccessibilityText(n.value?.value);
+      const description = normalizeAccessibilityText(n.description?.value);
       const node: AccessibilityNode & { childIds?: string[] } = {
-        role: n.role?.value ?? 'unknown',
-        name: n.name?.value ?? '',
+        role: normalizeAccessibilityText(n.role?.value, 'unknown'),
+        name: normalizeAccessibilityText(n.name?.value),
       };
-      if (n.value?.value) node.value = n.value.value;
-      if (n.description?.value) node.description = n.description.value;
+      if (value !== '') node.value = value;
+      if (description !== '') node.description = description;
+      if (n.backendDOMNodeId) node.backendNodeId = n.backendDOMNodeId;
       if (n.childIds) node.childIds = n.childIds;
       nodeMap.set(n.nodeId, node);
 
@@ -376,6 +611,7 @@ export class BrowserAPI {
       };
       if (node.value) result.value = node.value;
       if (node.description) result.description = node.description;
+      if (node.backendNodeId) result.backendNodeId = node.backendNodeId;
 
       if (node.childIds && node.childIds.length > 0) {
         result.children = node.childIds
@@ -389,29 +625,322 @@ export class BrowserAPI {
     return rootId ? buildTree(rootId) : { role: 'RootWebArea', name: '' };
   }
 
+  /**
+   * Click an element by its CDP backend node ID.
+   * Uses DOM.resolveNode to get an objectId, then calls .click() on it.
+   * Falls back to bounding-box click if .click() is not appropriate.
+   */
+  async clickByBackendNodeId(backendNodeId: number): Promise<void> {
+    await this.ensureConnected();
+    this.ensureAttached();
+
+    await this.client.send('DOM.enable', {}, this.sessionId!);
+    await this.client.send('Runtime.enable', {}, this.sessionId!);
+
+    // Resolve backendNodeId to a remote object
+    const resolveResult = await this.client.send(
+      'DOM.resolveNode',
+      { backendNodeId },
+      this.sessionId!
+    );
+    const object = resolveResult['object'] as { objectId?: string } | undefined;
+    if (!object?.objectId) {
+      throw new Error(`Could not resolve backend node ${backendNodeId} to a DOM element`);
+    }
+
+    // Scroll into view and get bounding box via JS
+    const boxResult = await this.client.send(
+      'Runtime.callFunctionOn',
+      {
+        objectId: object.objectId,
+        functionDeclaration: `function() {
+          this.scrollIntoView({ block: 'center', inline: 'center' });
+          const r = this.getBoundingClientRect();
+          return { x: r.x, y: r.y, width: r.width, height: r.height };
+        }`,
+        returnByValue: true,
+      },
+      this.sessionId!
+    );
+
+    const boxValue = (boxResult['result'] as { value?: BoundingBox })?.value;
+    if (!boxValue || boxValue.width === 0 || boxValue.height === 0) {
+      // Element has no dimensions — fall back to programmatic click
+      await this.client.send(
+        'Runtime.callFunctionOn',
+        {
+          objectId: object.objectId,
+          functionDeclaration: 'function() { this.click(); }',
+        },
+        this.sessionId!
+      );
+      return;
+    }
+
+    // Click at center of the element's bounding box
+    const x = boxValue.x + boxValue.width / 2;
+    const y = boxValue.y + boxValue.height / 2;
+
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mousePressed', x, y, button: 'left', clickCount: 1 },
+      this.sessionId!
+    );
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 },
+      this.sessionId!
+    );
+  }
+
+  /**
+   * Double-click an element by its CDP backend node ID.
+   */
+  async dblclickByBackendNodeId(
+    backendNodeId: number,
+    button: 'left' | 'right' | 'middle' = 'left'
+  ): Promise<void> {
+    await this.ensureConnected();
+    this.ensureAttached();
+
+    const { x, y } = await this.resolveNodeCenter(backendNodeId);
+
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mousePressed', x, y, button, clickCount: 1 },
+      this.sessionId!
+    );
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseReleased', x, y, button, clickCount: 1 },
+      this.sessionId!
+    );
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mousePressed', x, y, button, clickCount: 2 },
+      this.sessionId!
+    );
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseReleased', x, y, button, clickCount: 2 },
+      this.sessionId!
+    );
+  }
+
+  /**
+   * Hover over an element by its CDP backend node ID.
+   */
+  async hoverByBackendNodeId(backendNodeId: number): Promise<void> {
+    await this.ensureConnected();
+    this.ensureAttached();
+
+    const { x, y } = await this.resolveNodeCenter(backendNodeId);
+
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseMoved', x, y },
+      this.sessionId!
+    );
+  }
+
+  /**
+   * Select a value on a <select> element by its CDP backend node ID.
+   */
+  async selectByBackendNodeId(backendNodeId: number, value: string): Promise<void> {
+    await this.ensureConnected();
+    this.ensureAttached();
+
+    const objectId = await this.resolveNodeObjectId(backendNodeId);
+
+    await this.client.send(
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: `function(val) { this.value = val; this.dispatchEvent(new Event('change', { bubbles: true })); }`,
+        arguments: [{ value }],
+        returnByValue: true,
+      },
+      this.sessionId!
+    );
+  }
+
+  /**
+   * Check or uncheck a checkbox/radio element by its CDP backend node ID.
+   * Only clicks if the current state differs from the desired state.
+   * Returns the action taken.
+   */
+  async setCheckedByBackendNodeId(
+    backendNodeId: number,
+    checked: boolean
+  ): Promise<'toggled' | 'already'> {
+    await this.ensureConnected();
+    this.ensureAttached();
+
+    const objectId = await this.resolveNodeObjectId(backendNodeId);
+
+    const stateResult = await this.client.send(
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: `function() { return this.checked; }`,
+        returnByValue: true,
+      },
+      this.sessionId!
+    );
+    const currentChecked = (stateResult['result'] as { value?: boolean })?.value;
+
+    if (currentChecked === checked) {
+      return 'already';
+    }
+
+    // Click to toggle
+    await this.clickByBackendNodeId(backendNodeId);
+    return 'toggled';
+  }
+
+  /**
+   * Drag from one element to another by their CDP backend node IDs.
+   */
+  async dragByBackendNodeIds(startBackendNodeId: number, endBackendNodeId: number): Promise<void> {
+    await this.ensureConnected();
+    this.ensureAttached();
+
+    const start = await this.resolveNodeCenter(startBackendNodeId);
+    const end = await this.resolveNodeCenter(endBackendNodeId);
+
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mousePressed', x: start.x, y: start.y, button: 'left', clickCount: 1 },
+      this.sessionId!
+    );
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseMoved', x: end.x, y: end.y },
+      this.sessionId!
+    );
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseReleased', x: end.x, y: end.y, button: 'left', clickCount: 1 },
+      this.sessionId!
+    );
+  }
+
+  /**
+   * Send a raw CDP command on the current session.
+   * Used by playwright-cli for cookie operations via the Network domain.
+   */
+  async sendCDP(
+    method: string,
+    params: Record<string, unknown> = {}
+  ): Promise<Record<string, unknown>> {
+    await this.ensureConnected();
+    this.ensureAttached();
+    return await this.client.send(method, params, this.sessionId!);
+  }
+
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
 
   /**
+   * Resolve a backend node ID to a remote object ID.
+   */
+  private async resolveNodeObjectId(backendNodeId: number): Promise<string> {
+    await this.client.send('DOM.enable', {}, this.sessionId!);
+    await this.client.send('Runtime.enable', {}, this.sessionId!);
+
+    const resolveResult = await this.client.send(
+      'DOM.resolveNode',
+      { backendNodeId },
+      this.sessionId!
+    );
+    const object = resolveResult['object'] as { objectId?: string } | undefined;
+    if (!object?.objectId) {
+      throw new Error(`Could not resolve backend node ${backendNodeId} to a DOM element`);
+    }
+    return object.objectId;
+  }
+
+  /**
+   * Resolve a backend node ID to the center point of its bounding box.
+   * Scrolls the element into view first.
+   */
+  private async resolveNodeCenter(backendNodeId: number): Promise<{ x: number; y: number }> {
+    const objectId = await this.resolveNodeObjectId(backendNodeId);
+
+    const boxResult = await this.client.send(
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: `function() {
+          this.scrollIntoView({ block: 'center', inline: 'center' });
+          const r = this.getBoundingClientRect();
+          return { x: r.x, y: r.y, width: r.width, height: r.height };
+        }`,
+        returnByValue: true,
+      },
+      this.sessionId!
+    );
+
+    const boxValue = (boxResult['result'] as { value?: BoundingBox })?.value;
+    if (!boxValue || boxValue.width === 0 || boxValue.height === 0) {
+      throw new Error(`Element with backend node ${backendNodeId} has no dimensions`);
+    }
+
+    return {
+      x: boxValue.x + boxValue.width / 2,
+      y: boxValue.y + boxValue.height / 2,
+    };
+  }
+
+  /**
    * Lazily connect (or reconnect) to the CDP proxy.
    * Resets stale session/target state when reconnecting after a drop.
+   * If the current client is a disconnected remote transport, restores the local transport.
    */
   private async ensureConnected(): Promise<void> {
     if (this.client.state === 'disconnected') {
+      // If we were using a remote transport that got disconnected (follower went away),
+      // restore the local transport and clear stale remote state.
+      if (this.remoteTargetInfo && this.trayTargetProvider?.removeRemoteTransport) {
+        this.trayTargetProvider.removeRemoteTransport(
+          this.remoteTargetInfo.runtimeId,
+          this.remoteTargetInfo.localTargetId
+        );
+        this.setClient(this.localClient);
+        this.remoteTargetInfo = null;
+      }
       // Previous session/target are no longer valid after reconnect
       this.sessionId = null;
       this.attachedTargetId = null;
-      await this.connect();
+      if (this.client.state === 'disconnected') {
+        await this.connect();
+      }
     }
   }
 
   private ensureAttached(): void {
     if (!this.sessionId) {
-      throw new Error(
-        'Not attached to a page. Call attachToPage(targetId) first.',
-      );
+      throw new Error('Not attached to a page. Call attachToPage(targetId) first.');
     }
+  }
+
+  private addDialogListener(client: CDPTransport): void {
+    client.on('Page.javascriptDialogOpening', this.handleJavaScriptDialogOpening);
+  }
+
+  private removeDialogListener(client: CDPTransport): void {
+    client.off('Page.javascriptDialogOpening', this.handleJavaScriptDialogOpening);
+  }
+
+  private setClient(client: CDPTransport): void {
+    if (this.client === client) {
+      return;
+    }
+
+    this.removeDialogListener(this.client);
+    this.client = client;
+    this.addDialogListener(this.client);
   }
 
   /**
@@ -420,11 +949,7 @@ export class BrowserAPI {
   private async boundingBox(selector: string): Promise<BoundingBox | null> {
     await this.client.send('DOM.enable', {}, this.sessionId!);
 
-    const docResult = await this.client.send(
-      'DOM.getDocument',
-      { depth: 0 },
-      this.sessionId!,
-    );
+    const docResult = await this.client.send('DOM.getDocument', { depth: 0 }, this.sessionId!);
     const rootNodeId = (docResult['root'] as { nodeId: number }).nodeId;
 
     let nodeId: number;
@@ -432,7 +957,7 @@ export class BrowserAPI {
       const queryResult = await this.client.send(
         'DOM.querySelector',
         { nodeId: rootNodeId, selector },
-        this.sessionId!,
+        this.sessionId!
       );
       nodeId = queryResult['nodeId'] as number;
     } catch {
@@ -441,11 +966,7 @@ export class BrowserAPI {
 
     if (!nodeId) return null;
 
-    const boxModel = await this.client.send(
-      'DOM.getBoxModel',
-      { nodeId },
-      this.sessionId!,
-    );
+    const boxModel = await this.client.send('DOM.getBoxModel', { nodeId }, this.sessionId!);
     const model = boxModel['model'] as {
       content: number[];
       width: number;

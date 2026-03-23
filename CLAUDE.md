@@ -2,270 +2,197 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Keep this root file high-signal and low-churn. Put fast-changing implementation detail in `docs/architecture.md`, `docs/development.md`, `docs/shell-reference.md`, or feature-local docs instead of expanding this file.
+
 ## Build and Development Commands
 
 ```bash
-# Standalone CLI mode
-npm run dev:full        # Full dev mode: Vite HMR + Chrome + CDP proxy (port 3000)
-npm run dev             # Vite dev server only (no Chrome/CDP)
-npm run build           # Production build (UI via Vite + CLI via TSC)
-npm run build:ui        # Vite build only into dist/ui/
-npm run build:cli       # TSC build only into dist/cli/
-npm run start           # Run production CLI (requires build first)
-
-# Chrome extension
-npm run build:extension # Build extension into dist/extension/ (load in chrome://extensions)
-
-# Shared
-npm run typecheck       # Typecheck both tsconfig targets
+npm run dev:full        # Full dev mode: Vite HMR + Chrome + CDP proxy (port 5710)
+npm run dev:full -- --prompt "mount /tmp"  # Auto-submit prompt (clears history/fs first)
+npm run dev:electron -- /Applications/Slack.app  # Electron attach mode
+npm run dev             # Same as dev:full (Vite HMR + Chrome + CDP proxy)
+npm run build           # Production build (UI via Vite + CLI/Electron via TSC)
+npm run build:extension # Build extension into dist/extension/
+npm run package:release # Package deterministic release artifacts into artifacts/release/
+npm run typecheck       # Typecheck browser + Node targets
 npm run test            # Vitest run (all tests)
-npm run test:watch      # Vitest watch mode
-npx vitest run src/fs/virtual-fs.test.ts  # Run a single test file
+npx vitest run src/fs/virtual-fs.test.ts  # Single test file
 ```
 
-Ports (CLI mode only): 3000 (UI server), 9222 (Chrome CDP), 24679 (Vite HMR WebSocket)
+### Tray / QA / Worker Commands
+
+```bash
+npm run qa:setup        # Build dist/extension and scaffold dedicated leader/follower/extension Chrome QA profiles
+npm run qa:leader       # Launch CLI dev mode with the isolated leader Chrome profile, auto-connected to staging tray hub
+npm run qa:follower     # Launch CLI dev mode with the isolated follower Chrome profile
+npm run qa:extension    # Rebuild/load the unpacked extension in the isolated extension Chrome profile
+npx wrangler dev        # Run the Cloudflare Worker tray hub locally (requires Wrangler)
+npx wrangler deploy --env staging  # Deploy the staging tray hub
+npx wrangler deploy     # Deploy the Cloudflare Worker tray hub
+WORKER_BASE_URL=https://... npx vitest run src/worker/deployed.test.ts  # Smoke-test a deployed tray hub
+```
+
+### Automated Testing with `--prompt`
+
+The `--prompt` flag auto-submits a prompt when the UI loads, clearing chat history and filesystem first. Useful for testing agent flows without manual interaction:
+
+```bash
+npm run dev:full -- --prompt "mount /tmp"     # Test mount approval UI
+npm run dev:full -- --prompt "ls /workspace"  # Test any agent command
+```
+
+Console logs from the browser are forwarded to the CLI terminal for debugging.
+
+**Requires Node >= 22** (LTS). Ports: 5710 (UI), 9222 (Chrome CDP), 9223 (Electron CDP), 24679 (Vite HMR)
 
 ## Philosophy
 
-Three foundational ideas:
-
-1. **The Claw Pattern (Steinberger-Karpathy)**: SLICC is a "claw" — a persistent orchestration layer on top of LLM agents. Claws add scheduling, messaging, event handling, and skills ecosystems on top of basic agent capabilities. The term was [coined by Andrej Karpathy](https://x.com/karpathy/status/2024987174077432126). [OpenClaw](https://github.com/openclaw/openclaw) (by Peter Steinberger) is the original implementation. SLICC is a claw that runs in the browser. The agent engine is [Pi](https://github.com/badlogic/pi-mono) by Mario Zechner (pi-agent-core, pi-ai).
-
-2. **Agents Love the CLI (Zechner)**: Pi has 4 tools: read, write, edit, bash. SLICC adds 1: browser. All other capabilities are shell commands (git, node, python, webhook, crontask, skill, upskill). When adding new capabilities, default to shell commands, not dedicated tools. MCP server definitions burn context tokens; CLI tools compose naturally. Zechner's principle: ["Bash is all you need."](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)
-
-3. **The Browser is the OS (Andreessen)**: All logic and state runs client-side. The server is a stateless relay for port listening, CDP launch, and CORS. When implementing new features, prefer browser-native APIs (IndexedDB, Service Workers, WASM, fetch). If the extension float (zero server) can't run it, question whether it belongs in the server.
+1. **The Claw Pattern**: SLICC is a persistent orchestration layer ("claw") on top of LLM agents, running in the browser. Agent engine is [Pi](https://github.com/badlogic/pi-mono) (pi-agent-core, pi-ai).
+2. **Agents Love the CLI**: Shell-first core — new capabilities should be shell commands, not dedicated tools. MCP burns context tokens; CLI tools compose naturally.
+3. **The Browser is the OS**: All logic/state runs client-side. Server is a stateless relay. Prefer browser-native APIs (IndexedDB, Service Workers, WASM, fetch).
 
 ## Principles
 
-When making architectural decisions, apply these in order:
-
-1. **Virtual CLIs over dedicated tools** — New capabilities should be shell commands first. Only create a dedicated tool if the capability cannot work through bash (like browser automation requiring screenshot binary data).
-
-2. **Browser-first implementation** — State in IndexedDB. Logic in the client. The server only does what browsers physically cannot. Every line of server code is a line that doesn't work in the extension float.
-
-3. **Minimal server** — The extension float has zero server. That's the target for all floats. If you're adding server code, justify why the browser can't do it.
-
-4. **Skills over hardcoded features** — New agent capabilities should be SKILL.md files, not code changes. The core stays minimal. Skills are natural language instructions following the [Agent Skills standard](https://agentskills.io).
+1. **Virtual CLIs over dedicated tools** — Shell commands first. Only create dedicated tools if bash can't do it.
+2. **Browser-first** — State in IndexedDB. Server only does what browsers physically cannot.
+3. **Minimal server** — Extension float has zero server. That's the target.
+4. **Skills over hardcoded features** — New agent capabilities should be SKILL.md files, not code changes.
 
 ## Concepts (Ice Cream Vocabulary)
 
-The codebase uses ice cream terminology consistently. When working on this code, use these terms:
+- **Cone**: Main agent ("sliccy"). Full filesystem access, all tools. Code: `orchestrator.ts`, `RegisteredScoop` with `isCone: true`.
+- **Scoops**: Isolated sub-agents with sandboxed filesystem (`/scoops/{name}/` + `/shared/`), own shell/conversation. Tools: `scoop_scoop`, `feed_scoop`, `drop_scoop`. Code: `scoop-context.ts`, `restricted-fs.ts`.
+- **Licks**: External events triggering scoops (webhooks, cron tasks). Code: `LickManager`, `LickEvent`. Shell: `webhook`, `crontask`.
+- **Floats**: Runtime environments — CLI (`src/cli/`), Extension (`src/extension/`), Electron (`src/cli/electron-main.ts`), Sliccstart (`sliccstart/` — native macOS launcher), Cloud (planned).
 
-- **Cone**: The main agent ("sliccy"). Human's point of interaction. Full filesystem access, all tools. Orchestrates scoops. Code: `orchestrator.ts`, type `RegisteredScoop` with `isCone: true`.
-
-- **Scoops**: Isolated sub-agents. Each gets sandboxed filesystem (`/scoops/{name}/` + `/shared/`), own shell, own conversation. Created via `scoop_scoop`, fed instructions via `feed_scoop`, removed via `drop_scoop`. Code: `scoop-context.ts`, `restricted-fs.ts`.
-
-- **Licks**: External events that trigger scoops. Types: webhooks, cron tasks, browser events (planned). Unified under `LickManager` and `LickEvent`. Shell commands: `webhook`, `crontask`. A lick arrives, the scoop reacts — no human in the loop.
-
-- **Floats**: Runtime environments. Three exist:
-  - CLI float: Node.js/Express + Chrome. Code: `src/cli/`.
-  - Extension float: Chrome extension side panel, zero server. Code: `src/extension/`.
-  - Cloud float (planned): Cloudflare Containers or E2B sandboxes.
-
-When renaming or refactoring, prefer ice cream terms over technical jargon (e.g., "feed_scoop" not "delegate_to_scoop", "lick" not "event").
+Use ice cream terms over technical jargon (e.g., "feed_scoop" not "delegate_to_scoop").
 
 ## Architecture
 
-Browser-based AI coding agent: a self-contained development environment where Claude writes code, runs shell commands, and automates browser tabs entirely within Chrome, without touching the host filesystem. Runs as a **Chrome extension** (side panel) or as a **standalone CLI** server.
+Browser-based AI coding agent running as Chrome extension (side panel), standalone CLI server, or Electron float.
 
-### Two Deployment Modes
+### Three Deployment Modes
 
-- **Chrome extension** (Manifest V3): Side panel UI with tabbed layout (Chat/Terminal/Files/Memory). Uses `chrome.debugger` API for browser automation. Built via `npm run build:extension` -> `dist/extension/`. Load as unpacked extension in `chrome://extensions`. Pyodide bundled for Python support (~13MB).
-- **Standalone CLI**: Express server launches Chrome, proxies CDP over WebSocket. Resizable split layout with scoops panel + chat + terminal + files/memory. Built via `npm run build` -> `dist/ui/` + `dist/cli/`.
+- **Chrome extension** (Manifest V3): Three-layer — side panel (UI), service worker (relay + CDP proxy), offscreen document (agent engine). Agent survives side panel close.
+- **Standalone CLI**: Express server launches Chrome, proxies CDP. Split layout with scoops + chat + terminal + files/memory.
+- **Electron float**: Reuses CLI server in `--serve-only` mode, injects overlay shell.
 
-### Three Build Targets
-
-- **Browser bundle** (tsconfig.json): Everything in src/ except src/cli/. Bundled by Vite, module resolution: bundler. Runs in Chrome.
-- **CLI server** (tsconfig.cli.json): Only src/cli/. Compiled by TSC to dist/cli/, module resolution: NodeNext. Runs in Node.
-- **Extension bundle** (vite.config.extension.ts): Same browser bundle with extension-specific entry points (service-worker.js, sandbox.html, manifest.json) plus bundled Pyodide. Output: dist/extension/.
-
-### Layer Stack (bottom-up)
+### Layer Stack
 
 ```
-Virtual Filesystem (src/fs/)
-  -> RestrictedFS (path ACL for scoops)
-    -> Shell (src/shell/)
-    -> Git (src/git/)
-  -> CDP (src/cdp/)
-  -> Tools (src/tools/)
-    -> Core Agent (src/core/)
-      -> Scoops Orchestrator (src/scoops/)
-        -> UI (src/ui/)
-          -> CLI Server (src/cli/) | Extension (src/extension/)
+Virtual Filesystem (src/fs/) → RestrictedFS → Shell (src/shell/) + Git (src/git/)
+  → CDP (src/cdp/) → Tools (src/tools/) → Core Agent (src/core/)
+    → Scoops Orchestrator (src/scoops/) → UI (src/ui/)
+      → CLI/Electron (src/cli/) | Extension (src/extension/)
 ```
 
-### The Cone and Scoops (src/scoops/)
+### Build Targets
 
-SLICC uses an ice cream theme for its multi-agent system. The **cone** is the main assistant (sliccy) that holds everything together. **Scoops** are isolated agent contexts stacked on top, each with their own tools, shell, and restricted filesystem.
+- **Browser bundle** (tsconfig.json): Everything except src/cli/. Bundled by Vite.
+- **CLI/Electron** (tsconfig.cli.json): Only src/cli/. Compiled by TSC to dist/cli/.
+- **Extension** (vite.config.extension.ts): Browser bundle + extension entry points + bundled Pyodide.
 
-- **Orchestrator** (`orchestrator.ts`): Creates/destroys scoop contexts, routes messages, manages the single shared VirtualFS, handles scoop completion notifications back to the cone.
-- **ScoopContext** (`scoop-context.ts`): Per-scoop agent instance with RestrictedFS, WasmShell, skills, and NanoClaw-style tools (send_message).
-- **Delegation**: The cone feeds work to scoops via the `feed_scoop` tool, providing complete self-contained prompts (scoops have no access to the cone's conversation). When a scoop finishes, the orchestrator automatically routes its response back to the cone's message queue.
-- **Unified Filesystem**: One VirtualFS (`slicc-fs` IndexedDB). Cone gets unrestricted access. Each scoop gets a `RestrictedFS` limited to `/scoops/{name}/` + `/shared/`. Parent directory traversal is allowed for `stat`/`exists` (so `cd` works), but reads/writes outside the sandbox are blocked.
-- **DB** (`db.ts`): IndexedDB schema v2 with `scoops`, `messages`, `sessions`, `tasks`, `state` stores. Migration from v1 groups schema.
+### Key Subsystems
 
-### Virtual Filesystem (src/fs/)
-POSIX-like async filesystem backed by LightningFS (IndexedDB). VirtualFS is the facade. FsError carries POSIX error codes (ENOENT, EISDIR, EACCES, etc.). All paths are absolute, forward-slash, normalized.
+**Orchestrator** (`src/scoops/orchestrator.ts`): Creates/destroys scoops, routes messages, manages VFS. Cone delegates via `feed_scoop` — scoops get complete self-contained prompts (no access to cone's conversation).
 
-**RestrictedFS** (`restricted-fs.ts`): Wraps VirtualFS with path-based access control for scoops.
-- Read operations (stat, exists, readDir): return ENOENT/empty for outside paths. Parent directories of allowed paths are traversable (needed for `cd`).
-- Write operations (writeFile, mkdir, rm, rename): throw EACCES for outside paths.
-- `readDir` on parent dirs filters to only entries leading toward allowed paths.
-- `getLightningFS()` delegated for isomorphic-git compatibility.
+**VirtualFS** (`src/fs/`): POSIX-like async FS backed by LightningFS (IndexedDB). `RestrictedFS` wraps it with path ACLs for scoops. `FsError` carries POSIX error codes.
 
-### Shell (src/shell/)
-WasmShell wraps just-bash 2.11.7 (WASM Bash interpreter) and connects it to VirtualFS via VfsAdapter (implements just-bash's IFileSystem). The shell maintains env/cwd state across calls. Terminal UI via xterm.js with dynamic imports (so tests run in Node without xterm). Supports 78+ commands, escape sequences (arrow keys, Home/End/Delete), multi-line editing with continuation buffer, and proxied fetch for curl/networking (via `/api/fetch-proxy` in CLI mode, direct fetch with `host_permissions` in extension mode). Binary response handling: `readResponseBody()` detects content-type and uses latin1 encoding for binary types to preserve byte fidelity through just-bash's string-typed FetchResult. A binary cache (`binary-cache.ts`) stores raw Uint8Array for VfsAdapter to bypass string encoding on write.
+**Shell** (`src/shell/`): WasmShell wraps just-bash 2.11.7 (WASM). 78+ commands including `git`, `node -e`, `python3 -c`, `playwright-cli`, `open`, `serve`, `sqlite3`, `convert`, `pdftk`, `skill`, `upskill`, `webhook`, `crontask`, `mount`, `oauth-token`, `debug`. Any `*.jsh` file on VFS is auto-discovered as a command. Extension CSP workaround: dynamic code routes through `sandbox.html`. **Two shell contexts in extension mode**: side panel has its own WasmShell (mounted in terminal tab), offscreen document has the agent's WasmShell (runs bash tool calls). Commands that affect the UI must handle both — use `window.__slicc_*` hooks for direct calls (panel) and `chrome.runtime.sendMessage` relay for offscreen→panel communication.
 
-**Custom shell commands** (`src/shell/supplemental-commands/`): Additional commands beyond bash builtins:
-- `skill list` — List installed skills with version and status
-- `skill install <name>` — Install a skill from `/workspace/skills/`
-- `skill uninstall <name>` — Remove an installed skill
-- `upskill <source>` — Install skills from GitHub repos or ClawHub registry
-  - `upskill owner/repo` — Install from GitHub repository
-  - `upskill owner/repo --skill name` — Install specific skill from repo
-  - `upskill clawhub:skill-name` — Install from ClawHub by name
-  - `upskill search "query"` — Search ClawHub for skills
-- `git` — Full git support via isomorphic-git
-- `node -e "code"` — Execute JavaScript
-- `python3 -c "code"` — Execute Python via Pyodide
-- `open <url>` — Open URL in browser tab
-- `zip/unzip` — Archive compression
-- `sqlite3` — SQLite database operations
-- `webhook` — Manage webhooks for event-driven automation
-- `crontask` — Schedule cron jobs that dispatch licks to scoops
-- `mount` — Mount a local directory into the virtual filesystem via the File System Access API
-- `convert` — ImageMagick-style image conversion (resize, rotate, crop, quality) via `@imagemagick/magick-wasm`
-- `commands` — Show all available commands (type `commands` in terminal)
+**CDP** (`src/cdp/`): `CDPTransport` interface with WebSocket (CLI) and `chrome.debugger` (extension) implementations. `BrowserAPI` provides Playwright-style API (listPages, navigate, screenshot, evaluate, click, etc.). Screenshots normalize DPR to 1.
 
-**Extension CSP workaround**: `node -e` in extension mode routes through the sandbox iframe (CSP blocks `AsyncFunction` constructor on extension pages). Python uses bundled Pyodide loaded from `chrome.runtime.getURL('pyodide/')`. ImageMagick WASM is fetched as bytes from `chrome.runtime.getURL('magick.wasm')` since `initializeImageMagick` rejects `chrome-extension://` URLs.
+**Tools** (`src/tools/`): Active tool surface: `read_file`, `write_file`, `edit_file`, `bash`, `javascript`, plus NanoClaw tools (`send_message`, cone-only: `list_scoops`, `scoop_scoop`, `feed_scoop`, `drop_scoop`, `update_global_memory`). Browser automation goes through shell commands via `bash`.
 
-### Skills System (src/skills/, src/scoops/skills.ts)
-Two complementary skill systems:
+**Core Agent** (`src/core/`): Uses pi-agent-core for agent loop, pi-ai for LLM streaming. `tool-adapter.ts` bridges legacy ToolDefinition to pi-compatible AgentTool. `SessionStore` persists conversations to IndexedDB.
 
-1. **Prompt injection** (`src/scoops/skills.ts`): Skills in `/workspace/skills/` with `SKILL.md` files are automatically loaded into the agent's system prompt. Headers are shown by default; full content loaded on demand via `read_file`.
+**Context Compaction** (`src/core/context-compaction.ts`): LLM-summarized compaction at ~183K tokens. Images auto-resized before LLM (5MB base64 limit). Overflow recovery replaces oversized messages (>40K chars) with placeholders.
 
-2. **Installation engine** (`src/skills/`): Full package manager for installing/uninstalling skill packages:
-   - Manifest-based installation (`manifest.yaml` with name, version, dependencies, conflicts)
-   - State tracking in `.slicc/state.json`
-   - Security validations (path traversal protection, manifest name matching)
-   - Dependency and conflict checking
+**UI** (`src/ui/`): Vanilla TypeScript, no framework. Extension mode: compact tabbed interface (Chat + Files visible by default; Terminal + Memory hidden — toggle with `debug on`). Standalone: resizable split layout with all panels visible. `main.ts` delegates to `mainExtension()` (OffscreenClient) or bootstraps Orchestrator directly. Tab bar is fully dynamic — `TabZone.addTab()`/`removeTab()` adds/removes tabs at runtime (used by sprinkle panels and the `debug` command).
 
-**Default skills** are bundled from `src/defaults/workspace/skills/` using Vite's `import.meta.glob`.
+**Extension** (`src/extension/`): Service worker relays messages + proxies chrome.debugger. Offscreen document runs agent engine (survives side panel close). Chat persistence: `browser-coding-agent` IndexedDB is single source of truth. **Key architecture detail**: the extension has two separate execution contexts with independent shell instances — the side panel (UI, terminal shell, Layout) and the offscreen document (agent engine, bash tool shell, Orchestrator). They share IndexedDB but NOT window globals. Communication is via `chrome.runtime` messages routed through the service worker. See `docs/architecture.md` "Extension Three-Layer Architecture".
 
-### CDP (src/cdp/)
-CDPTransport interface (`transport.ts`) abstracts the underlying protocol. Two implementations:
-- **CDPClient**: WebSocket-based, used in CLI mode. Connects through ws://localhost:3000/cdp proxy.
-- **DebuggerClient** (`debugger-client.ts`): Uses `chrome.debugger` API in extension mode. Intercepts `Target.*` commands and maps them to `chrome.tabs`/`chrome.debugger`. Manages tab attach/detach lifecycle with session-to-tab mapping.
+**Preview SW** (`src/ui/preview-sw.ts`): Intercepts `/preview/*` requests, serves VFS content. Built as IIFE via esbuild (not rollup — avoids code-splitting issues in SWs).
 
-BrowserAPI: high-level Playwright-style API built on either transport (listPages, navigate, screenshot, evaluate, click, type, waitForSelector, getAccessibilityTree). Auto-selects transport based on extension detection. TargetInfo and PageInfo types include `active` field (boolean, extension mode only) to identify the user's currently focused tab, enabling intelligent tool auto-dispatch.
+**Sprinkle Rendering** (`src/ui/sprinkle-renderer.ts`): Renders `.shtml` files as interactive UI panels. CLI mode: fragments injected into DOM directly, full documents rendered via srcdoc iframe. Extension mode: ALL content routes through `sprinkle-sandbox.html` (CSP-exempt manifest sandbox) — fragments rendered in sandbox body, full documents via nested srcdoc iframe inside sandbox. See the sprinkles skill (`src/defaults/workspace/skills/sprinkles/`) for rendering modes, bridge API, and style guide.
 
-**HarRecorder** (`har-recorder.ts`): Records network traffic from browser tabs as HAR 1.2 files. Supports user-provided JS filter functions (`(entry) => false | true | object`). Filter application is deferred to snapshot save time (batch, not per-entry) to support extension mode — in extensions, filter code is sent to the sandbox iframe (CSP-exempt) via `postMessage`; in CLI mode, compiled directly. Snapshots saved to `/recordings/{id}/` on navigation and recording stop. Graceful fallback: filter errors return unfiltered entries.
+**Inline Sprinkles** (`src/ui/inline-sprinkle.ts`): Agent ` ```shtml ` code blocks in chat messages are hydrated into sandboxed iframes after streaming completes. Minimal bridge (lick-only, no state) via postMessage. Auto-height via ResizeObserver. CLI mode: direct srcdoc iframe. Extension mode: routes through `sprinkle-sandbox.html` (same CSP-exempt sandbox as panel sprinkles). Lick events route to the cone via `routeLickToScoop` (CLI) or `client.sendSprinkleLick` (extension). CSS: `.msg__inline-sprinkle` container, `.sprinkle-action-card` component.
 
-### Tools (src/tools/)
-All tools use the legacy ToolDefinition interface (name, description, inputSchema, execute). Active agent tools: bash, read_file, write_file, edit_file, browser (with sub-actions), javascript. Factory functions take their dependency (VirtualFS, WasmShell, or BrowserAPI).
-
-**NanoClaw tools** (src/scoops/nanoclaw-tools.ts): Per-scoop tools for messaging — `send_message`. Cone-only tools: `list_scoops`, `scoop_scoop` (create), `feed_scoop` (delegate), `drop_scoop` (remove), `update_global_memory`. Task scheduling moved to the `crontask` shell command.
-
-**Browser tool enhancements:**
-- `screenshot` action now supports `path` (save PNG to VFS), `fullPage` (capture entire scrollable page), and `selector` (capture just one element)
-- `show_image` action displays image files from VFS inline in the chat with automatic base64 encoding
-- `serve` action serves a VFS directory as a web app in a new browser tab via the preview Service Worker. Takes `directory` (VFS path) and optional `entry` (default `index.html`). Creates a new tab and includes the targetId in the response text for subsequent snapshot/screenshot/evaluate calls. Validates `entry` against path traversal (`..`, absolute paths).
-- Auto-resolves to the user's active/focused tab when targetId is omitted (CDP types TargetInfo/PageInfo now include `active` field)
-- VFS access via `path` parameter to save results without bloating conversation history
-- App tab detection excludes `/preview/` URLs to prevent preview tabs from being misidentified as the SLICC app tab in extension mode
-
-**JavaScript tool**: `fs.readDir(path)` returns `string[]` (filenames). `fs.readFileBinary(path)` returns `Uint8Array` directly.
-
-### Core Agent (src/core/)
-Uses @mariozechner/pi-agent-core for the agent loop and @mariozechner/pi-ai for unified LLM streaming. Key types re-exported from pi packages: AgentMessage, AgentTool, AgentEvent, Model, StreamFn.
-
-- Agent class (from pi-agent-core): state management, `subscribe()` for events, `prompt()` for messages, `abort()` to stop
-- tool-adapter.ts: wraps legacy ToolDefinition into AgentTool (pi-compatible execute signature)
-- context-compaction.ts: `compactContext()` truncates oversized tool results and drops old messages to stay within token limits. Applied to every scoop via `transformContext`.
-- types.ts: self-contained type definitions (ToolDefinition, ToolResult, AgentConfig, SessionData)
-
-### UI (src/ui/)
-Vanilla TypeScript, no framework. Two layout modes selected by `isExtension` detection:
-- **Extension mode**: Compact single-row header (slicc + scoop dropdown + model dropdown + icon buttons). Tabbed interface (Chat/Terminal/Files/Memory). Scoop switcher as dropdown menu.
-- **Standalone mode**: Resizable split layout — scoops panel (left) + chat + terminal (top-right) + files/memory tabs (bottom-right).
-
-main.ts bootstraps the orchestrator (always cone+orchestrator, no direct agent mode) and wires events. Per-scoop message buffers capture tool calls even when viewing a different scoop. Input locks immediately when the cone starts processing (including auto-activation from scoop notifications). Assistant label is "sliccy" for the cone, `{name}-scoop` for scoops.
-
-File browser supports clicking files to download and a ZIP button on folders (uses fflate) to download entire directories.
-
-Two separate IndexedDB session stores: UI-level (browser-coding-agent DB in session-store.ts) and core agent-level (agent-sessions DB in core/session.ts). Orchestrator data (scoops, messages, tasks, state) stored in slicc-groups DB (name retained for backward compatibility).
-
-**Voice Input** (`voice-input.ts`): Hands-free voice mode using the Web Speech API (`webkitSpeechRecognition`). Two runtime paths:
-- **Standalone (CLI)**: Direct `getUserMedia` + `webkitSpeechRecognition` in the browser page.
-- **Extension**: Side panels can't trigger mic permission prompts. First use opens a popup window (`voice-popup.html`) for the one-time permission grant. Once granted, subsequent uses work directly in the side panel (permission cached per `chrome-extension://` origin). Falls back to popup if direct access fails.
-
-Voice mode is a toggle (mic button or `Ctrl+Shift+V` / `Cmd+Shift+V`): click once to enable, click again to disable. While enabled, the user speaks → 2.5s silence → message auto-sends → input locks during agent response → voice auto-restarts when the turn ends. Mic button stays clickable during streaming so voice mode can be toggled off. Consecutive no-speech restarts use exponential backoff (300ms → 5s cap) to prevent rapid mic toggling. Settings (`voice-auto-send`, `voice-lang`) stored in localStorage.
-
-Extension assets: `voice-popup.html` + `voice-popup.js` (project root, copied to `dist/extension/` by `vite.config.extension.ts`).
-
-### Extension (src/extension/)
-Chrome Manifest V3 extension files. Service worker opens the side panel on action click. `chrome.d.ts` provides minimal typed declarations for the Chrome APIs used (debugger, tabs, sidePanel, runtime, windows, messaging). `sandbox.html` (project root) provides an isolated execution environment for the JavaScript tool and `node -e` — exempt from extension CSP, allows Function constructor. Cross-origin fetch from sandbox is proxied through the parent page via postMessage. Pyodide (~13MB) bundled at `dist/extension/pyodide/` for Python support (loaded from `'self'` origin).
-
-### Preview Service Worker (src/ui/preview-sw.ts)
-A Service Worker that intercepts `/preview/*` fetch requests and serves content from VFS (IndexedDB via LightningFS). Enables the agent to create HTML/CSS/JS apps in the virtual filesystem and preview them in real browser tabs.
-
-- Registered at app startup in `main.ts` with scope `/preview/`
-- Strips `/preview` prefix to get the VFS path, reads the file, responds with correct MIME type
-- Handles directory requests by appending `/index.html`
-- Returns 404 for missing files
-- Uses `skipWaiting()` + `clients.claim()` for immediate activation
-- **Build strategy**: Built as a self-contained IIFE via esbuild (not rollup). Rollup would code-split LightningFS into a shared chunk that SWs can't import. In dev mode, a Vite plugin (`preview-sw-builder`) bundles and serves it on the fly at `/preview-sw.js`. In production, a `closeBundle` hook writes the bundle to the output directory.
-- MIME type mapping via inline `getMimeType()` (same logic as `src/core/mime-types.ts` but inlined since the SW is a separate bundle)
-
-### CLI Server (src/cli/index.ts)
-Express server that launches Chrome with remote debugging, serves the UI (Vite middleware in dev, static files in prod), and runs a WebSocket proxy at /cdp. Provides `/api/fetch-proxy` endpoint for cross-origin fetch (replaces CORS proxy). Single shared Chrome WebSocket connection with client message buffering. Console forwarder pipes in-page console output to CLI stdout.
-
-### Context Compaction (src/core/context-compaction.ts)
-To prevent context overflow (200K token limit), the agent applies two-phase message compaction before each API call:
-1. **Result truncation**: Tool results larger than 8000 chars (~2K tokens) are truncated with a marker
-2. **Message dropping**: If total context exceeds ~150K tokens, old messages (except first 2 and last 10) are dropped and replaced with a compaction marker message
-
-This preserves recent context and the initial exchange while preventing runaway token usage. Applied to every scoop context via `transformContext: compactContext`.
+**Skills** (`src/skills/`, `src/scoops/skills.ts`): SKILL.md files in `/workspace/skills/` auto-load into system prompt. Installation engine supports manifest-based packages with dependency/conflict checking.
 
 ### Data Flow
-```
-User -> ChatPanel -> AgentHandle.sendMessage()
-  -> Orchestrator.handleMessage() -> routeToScoop() -> processScoopQueue()
-    -> ScoopContext.prompt() -> pi-agent-core loop -> LLM API (streaming)
-      -> AgentEvent stream -> Orchestrator callbacks -> per-scoop message buffer
-        -> emitToUI (if selected) -> ChatPanel DOM
-      -> Tool calls -> RestrictedFS / WasmShell / BrowserAPI -> results -> back to agent loop
-    -> Scoop completes -> Orchestrator notification -> Cone's message queue -> Cone reacts
 
-Delegation:
-  Cone -> feed_scoop tool -> Orchestrator.delegateToScoop()
-    -> ScoopContext.prompt() (with full context from cone) -> ... -> completion notification -> Cone
 ```
+User → ChatPanel → Orchestrator → ScoopContext.prompt() → pi-agent-core → LLM API
+  → Tool calls → RestrictedFS / WasmShell / BrowserAPI → results → back to agent loop
+  → Scoop completes → Orchestrator → Cone's message queue
+```
+
+### Tray / Teleport Addendum
+
+- Tray hub code lives in `src/worker/` with config in `wrangler.jsonc`; treat it as coordination infrastructure, not canonical session storage.
+- When a tray is connected, remote browser targets are exposed through federated target routing; keep CDP local to the runtime that owns the page.
+- Teleport is part of the browser/shell workflow: `playwright teleport --start=<regex> --return=<regex>` and equivalent flags on `open`, `tab-new`, and navigation commands.
+- Any `*.bsh` file is a browser-navigation helper. Keep detailed behavior in docs rather than growing this root guide.
 
 ## Key Conventions
 
-- **Two type systems**: Legacy ToolDefinition/ToolResult (in src/tools/) and pi-compatible AgentTool/AgentToolResult (in src/core/). The adapter in tool-adapter.ts bridges them.
-- **Tests are colocated**: foo.test.ts next to foo.ts. Vitest with globals: true, environment: node. New pure-logic code (utilities, adapters, data transformations) should always have tests. DOM-dependent code (UI panels, layout) and chrome.* API code (DebuggerClient) are acceptable to skip in Node tests but should be manually verified. Use `fake-indexeddb/auto` for tests that need VFS. Current count: 640 tests across 35 files.
-- **Logging**: createLogger('namespace') from src/core/logger.ts. Level-filtered, DEBUG in dev, ERROR in prod. Uses __DEV__ global (set by Vite define).
-- **Node shims**: src/shims/empty.ts stubs out node:zlib and node:module for the browser bundle (just-bash references them).
-- **Multi-provider auth**: Provider settings in `src/ui/provider-settings.ts`. Supports Anthropic (direct), Azure AI Foundry (Claude on Azure), Azure OpenAI (GPT), AWS Bedrock, and many more via pi-ai. Provider/API key/baseUrl stored in localStorage. Model resolved via `resolveCurrentModel()` with baseUrl override.
-- **Extension detection**: `typeof chrome !== 'undefined' && !!chrome?.runtime?.id` — used throughout to select CDP transport, layout mode, fetch strategy, JS tool sandbox mechanism, and Pyodide loading path.
-- **Dual-mode compatibility**: New features MUST work in both standalone CLI mode and Chrome extension mode. Extension CSP blocks dynamic eval and CDN fetches. Pattern: use sandbox iframe (`sandbox.html`) for dynamic code execution, `chrome.runtime.getURL()` + fetch for bundled WASM/assets, and three-branch detection (Node/Extension/Browser) for resource loading. Bundle extension assets in `vite.config.extension.ts` `closeBundle` hook. Always test in both modes.
+- **Two type systems**: Legacy ToolDefinition (src/tools/) and pi-compatible AgentTool (src/core/). Bridged by `tool-adapter.ts`.
+- **Colocated tests**: `foo.test.ts` next to `foo.ts`. Vitest, globals: true, environment: node. Use `fake-indexeddb/auto` for VFS tests.
+- **Logging**: `createLogger('namespace')` from `src/core/logger.ts`. DEBUG in dev, ERROR in prod.
+- **Extension detection**: `typeof chrome !== 'undefined' && !!chrome?.runtime?.id`
+- **Dual-mode compatibility**: Features MUST work in both CLI and extension. Extension CSP blocks eval/CDN — use `sandbox.html` for dynamic code, `sprinkle-sandbox.html` for sprinkles/inline widgets, `chrome.runtime.getURL()` for bundled assets.
+- **Extension `window.open()` returns `null`**: Fire-and-forget; don't treat null as failure.
+- **Model ID aliases**: Use pi-ai aliases (e.g., `claude-opus-4-6`) not dated snapshot IDs.
+- **Provider composition**: Auto-discovered from pi-ai. External providers: drop `.ts` in root `providers/`. OAuth via `createOAuthLauncher()` in `src/providers/oauth-service.ts`. Registration runs in both `main.ts` and `offscreen.ts`.
+- **Two CLAUDE.md files**: This one (project root) is for Claude Code. `src/defaults/shared/CLAUDE.md` is for the agent (bundled to `/shared/CLAUDE.md`).
+- **Default VFS content**: `src/defaults/` bundled into VFS via `import.meta.glob`.
+- **Preview URLs**: Use `toPreviewUrl(vfsPath)` from `src/shell/supplemental-commands/shared.ts`.
+
+## Change Requirements
+
+Every change MUST satisfy three gates: **tests**, **docs**, and **verification**.
+
+### Tests
+
+New pure-logic code MUST have colocated tests (`foo.test.ts`). See `docs/testing.md`.
+
+### Visual Sprinkle Testing
+Static HTML test pages in `test/visual/` for visually verifying sprinkle components and built-in sprinkles. Served by Vite dev server at `http://localhost:5173/test/visual/`.
+
+```bash
+npm run dev   # then open:
+# http://localhost:5173/test/visual/sprinkle-builtin-test.html  — all 11 built-in sprinkles with TAVEX mock data
+# http://localhost:5173/test/visual/sprinkle-production-test.html — component showcase with production CSS
+```
+
+**Architecture**: Test pages fetch production CSS from `/index.html` at runtime via DOMParser, so they always reflect the real theme. Built-in sprinkles load in iframes; the bridge + mock data are injected via `iframe.onload` + `contentWindow.eval()` (inline `<script>` in srcdoc does not execute reliably). Mock data is based on the TAVEX pharma page and covers all 10 data-driven sprinkle DATA CONTRACTs.
+
+### Documentation
+
+| Tier                | File        | Update when...                                     |
+| ------------------- | ----------- | -------------------------------------------------- |
+| **Public**          | `README.md` | User-facing changes                                |
+| **Development**     | `CLAUDE.md` | Developer conventions, architecture, build changes |
+| **Agent reference** | `docs/`     | Agent-facing tools, commands, patterns             |
+
+### Verification
+
+All four must pass before committing:
+
+```bash
+npm run typecheck
+npm run test
+npm run build
+npm run build:extension
+```
+
+**CI**: Same four gates run on every PR via `.github/workflows/ci.yml`.
+
+### Worker Deploy CI
+
+Tray-hub deploys use `.github/workflows/worker.yml` for staging and production. Use the repo-level `CLOUDFLARE_API_TOKEN` secret plus `CLOUDFLARE_ACCOUNT_ID` variable, and let `cloudflare/wrangler-action` surface the deployed URL for `src/worker/deployed.test.ts`.
 
 ## Git Integration (src/git/)
-Git support via isomorphic-git with LightningFS as the backing store. GitCommands class provides CLI-like interface for git operations (init, clone, add, commit, status, log, branch, checkout, diff, remote, fetch, pull, push, config, rev-parse). Registered as a custom command in just-bash so it works in compound commands and via the bash tool.
 
-- **Authentication**: Set `git config github.token <PAT>` to authenticate with GitHub (avoids rate limits on public repos, required for private repos)
-- **CORS handling**: In CLI mode, git HTTP requests route through `/api/fetch-proxy`. In extension mode, uses direct fetch with host_permissions.
-- **Unified filesystem**: VirtualFS wraps LightningFS, exposing `getLightningFS()` for isomorphic-git compatibility. Shell, git, file browser, and tools all share the same filesystem.
-
-## Debugging Browser Features
-
-When developing or debugging browser-based features (terminal, file browser, agent behavior), use the `agent-browser` skill to automate Chrome and observe behavior directly:
-
-1. **Start the dev server**: `npm run dev:full` (launches Chrome with CDP on port 9222)
-2. **Use agent-browser skill**: Invoke the skill to navigate, interact with UI elements, take screenshots, and inspect state
-3. **Check CLI logs**: The Express server logs all requests. Console output from the browser is forwarded to CLI stdout via the CDP console forwarder.
-4. **Add temporary debug logging**: Use `console.log()` in browser code — output appears in CLI terminal. Remove before committing.
-
-This approach keeps the human out of the debug loop by letting the agent directly observe browser behavior, check network requests in CLI logs, and iterate without manual intervention.
+isomorphic-git with LightningFS. Auth: `git config github.token <PAT>`. CORS: CLI routes through `/api/fetch-proxy`, extension uses direct fetch.

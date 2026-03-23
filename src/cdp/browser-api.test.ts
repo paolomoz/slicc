@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { BrowserAPI } from './browser-api.js';
-import { CDPClient } from './cdp-client.js';
+import { BrowserAPI, getDefaultCdpUrl } from './browser-api.js';
+import { type CDPClient } from './cdp-client.js';
 
 // ---------------------------------------------------------------------------
 // Mock CDPClient
@@ -56,10 +56,19 @@ describe('BrowserAPI', () => {
   });
 
   describe('connect / disconnect', () => {
+    it('derives the default URL from the current location when available', () => {
+      expect(getDefaultCdpUrl({ protocol: 'https:', host: 'example.com' })).toBe(
+        'wss://example.com/cdp'
+      );
+      expect(getDefaultCdpUrl({ protocol: 'http:', host: 'localhost:3030' })).toBe(
+        'ws://localhost:3030/cdp'
+      );
+    });
+
     it('connects with default URL', async () => {
       await api.connect();
       expect(mockClient.connect).toHaveBeenCalledWith({
-        url: 'ws://localhost:3000/cdp',
+        url: 'ws://localhost:5710/cdp',
         timeout: undefined,
       });
     });
@@ -88,7 +97,7 @@ describe('BrowserAPI', () => {
 
       // connect() should have been called
       expect(mockClient.connect).toHaveBeenCalledWith({
-        url: 'ws://localhost:3000/cdp',
+        url: 'ws://localhost:5710/cdp',
         timeout: undefined,
       });
     });
@@ -119,7 +128,9 @@ describe('BrowserAPI', () => {
 
     it('auto-connects on attachToPage when disconnected', async () => {
       (mockClient as unknown as { state: string }).state = 'disconnected';
-      (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ sessionId: 'sess-new' });
+      (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        sessionId: 'sess-new',
+      });
 
       const sessionId = await api.attachToPage('target-1');
       expect(sessionId).toBe('sess-new');
@@ -131,9 +142,27 @@ describe('BrowserAPI', () => {
     it('returns page targets', async () => {
       (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         targetInfos: [
-          { targetId: 't1', type: 'page', title: 'Google', url: 'https://google.com', attached: false },
-          { targetId: 't2', type: 'page', title: 'GitHub', url: 'https://github.com', attached: false },
-          { targetId: 't3', type: 'service_worker', title: 'SW', url: 'chrome://sw', attached: false },
+          {
+            targetId: 't1',
+            type: 'page',
+            title: 'Google',
+            url: 'https://google.com',
+            attached: false,
+          },
+          {
+            targetId: 't2',
+            type: 'page',
+            title: 'GitHub',
+            url: 'https://github.com',
+            attached: false,
+          },
+          {
+            targetId: 't3',
+            type: 'service_worker',
+            title: 'SW',
+            url: 'chrome://sw',
+            attached: false,
+          },
         ],
       });
 
@@ -152,6 +181,40 @@ describe('BrowserAPI', () => {
     });
   });
 
+  describe('listAllTargets', () => {
+    it('keeps remote tray targets whose local target ids match a local page', async () => {
+      (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        targetInfos: [
+          {
+            targetId: 'tab-1',
+            type: 'page',
+            title: 'Local Page',
+            url: 'https://local.example.com',
+            attached: false,
+          },
+        ],
+      });
+
+      api.setTrayTargetProvider({
+        getTargets: () => [
+          {
+            targetId: 'follower-1:tab-1',
+            localTargetId: 'tab-1',
+            runtimeId: 'follower-1',
+            title: 'Remote Page',
+            url: 'https://remote.example.com',
+            isLocal: false,
+          },
+        ],
+      });
+
+      await expect(api.listAllTargets()).resolves.toEqual([
+        { targetId: 'tab-1', title: 'Local Page', url: 'https://local.example.com' },
+        { targetId: 'follower-1:tab-1', title: 'Remote Page', url: 'https://remote.example.com' },
+      ]);
+    });
+  });
+
   describe('attachToPage / detach', () => {
     it('attaches to a target and returns session ID', async () => {
       (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -164,6 +227,7 @@ describe('BrowserAPI', () => {
         targetId: 'target-1',
         flatten: true,
       });
+      expect(mockClient.send).toHaveBeenCalledWith('Page.enable', {}, 'sess-1');
     });
 
     it('detaches from current target before attaching to new one', async () => {
@@ -188,7 +252,58 @@ describe('BrowserAPI', () => {
       // send should not have been called for detach
       expect(mockClient.send).not.toHaveBeenCalledWith(
         'Target.detachFromTarget',
-        expect.anything(),
+        expect.anything()
+      );
+    });
+
+    it('auto-dismisses unexpected JavaScript dialogs for the attached session', async () => {
+      (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        sessionId: 'sess-1',
+      });
+      await api.attachToPage('target-1');
+
+      mockClient._fireEvent('Page.javascriptDialogOpening', {
+        sessionId: 'sess-1',
+        type: 'alert',
+        message: 'blocked',
+      });
+
+      await Promise.resolve();
+
+      expect(mockClient.send).toHaveBeenCalledWith(
+        'Page.handleJavaScriptDialog',
+        { accept: false },
+        'sess-1',
+        5000
+      );
+    });
+
+    it('keeps auto-dismiss handling after switching to a remote transport', async () => {
+      const remoteClient = createMockClient();
+      api.setTrayTargetProvider({
+        getTargets: () => [],
+        createRemoteTransport: () => remoteClient as unknown as CDPClient,
+      });
+
+      (remoteClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        sessionId: 'remote-sess',
+      });
+
+      await api.attachToPage('follower-1:tab-1');
+
+      remoteClient._fireEvent('Page.javascriptDialogOpening', {
+        sessionId: 'remote-sess',
+        type: 'alert',
+        message: 'blocked remotely',
+      });
+
+      await Promise.resolve();
+
+      expect(remoteClient.send).toHaveBeenCalledWith(
+        'Page.handleJavaScriptDialog',
+        { accept: false },
+        'remote-sess',
+        5000
       );
     });
   });
@@ -212,7 +327,7 @@ describe('BrowserAPI', () => {
       expect(mockClient.send).toHaveBeenCalledWith(
         'Page.navigate',
         { url: 'https://example.com' },
-        'sess-1',
+        'sess-1'
       );
     });
 
@@ -229,30 +344,75 @@ describe('BrowserAPI', () => {
       await api.attachToPage('target-1');
     });
 
-    it('captures a screenshot', async () => {
+    it('captures a viewport screenshot (no clip, Chrome default)', async () => {
       (mockClient.send as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8/x8AAwAB/aurH8kAAAAASUVORK5CYII=',
-      });
+        data: 'viewport-shot',
+      }); // Page.captureScreenshot
 
       const data = await api.screenshot();
-      expect(typeof data).toBe('string');
-      expect(data.length).toBeGreaterThan(0);
+      expect(data).toBe('viewport-shot');
       expect(mockClient.send).toHaveBeenCalledWith(
         'Page.captureScreenshot',
-        { format: 'png' },
-        'sess-1',
+        { format: 'png', captureBeyondViewport: true },
+        'sess-1'
       );
     });
 
-    it('captures full page screenshot', async () => {
+    it('full page screenshot at DPR 1 uses CSS dimensions with scale 1', async () => {
       (mockClient.send as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce({
-          contentSize: { width: 1024, height: 5000 },
-        }) // getLayoutMetrics
-        .mockResolvedValueOnce({ data: 'base64data' }); // captureScreenshot
+        .mockResolvedValueOnce({}) // Runtime.enable
+        .mockResolvedValueOnce({ result: { value: '{"dpr":1,"w":1280,"h":5000}' } }) // Runtime.evaluate
+        .mockResolvedValueOnce({ data: 'fullpage' }); // captureScreenshot
 
       const data = await api.screenshot({ fullPage: true });
-      expect(data).toBe('base64data');
+      expect(data).toBe('fullpage');
+      expect(mockClient.send).toHaveBeenCalledWith(
+        'Page.captureScreenshot',
+        {
+          format: 'png',
+          captureBeyondViewport: true,
+          clip: { x: 0, y: 0, width: 1280, height: 5000, scale: 1 },
+        },
+        'sess-1'
+      );
+    });
+
+    it('full page screenshot uses CSS dimensions with scale 1', async () => {
+      (mockClient.send as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({}) // Runtime.enable
+        .mockResolvedValueOnce({ result: { value: '{"w":1440,"h":3130}' } }) // Runtime.evaluate
+        .mockResolvedValueOnce({ data: 'hidpi' }); // captureScreenshot
+
+      const data = await api.screenshot({ fullPage: true });
+      expect(data).toBe('hidpi');
+      expect(mockClient.send).toHaveBeenCalledWith(
+        'Page.captureScreenshot',
+        {
+          format: 'png',
+          captureBeyondViewport: true,
+          clip: { x: 0, y: 0, width: 1440, height: 3130, scale: 1 },
+        },
+        'sess-1'
+      );
+    });
+
+    it('passes through provided clip with scale 1', async () => {
+      (mockClient.send as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({}) // Runtime.enable
+        .mockResolvedValueOnce({ result: { value: '{"w":1280,"h":3000}' } }) // Runtime.evaluate
+        .mockResolvedValueOnce({ data: 'clipped' }); // captureScreenshot
+
+      const data = await api.screenshot({ clip: { x: 10, y: 20, width: 300, height: 400 } });
+      expect(data).toBe('clipped');
+      expect(mockClient.send).toHaveBeenCalledWith(
+        'Page.captureScreenshot',
+        {
+          format: 'png',
+          captureBeyondViewport: true,
+          clip: { x: 10, y: 20, width: 300, height: 400, scale: 1 },
+        },
+        'sess-1'
+      );
     });
   });
 
@@ -320,7 +480,9 @@ describe('BrowserAPI', () => {
 
       // Verify mouse events were dispatched at center of element
       const pressCall = (mockClient.send as ReturnType<typeof vi.fn>).mock.calls.find(
-        (c: unknown[]) => c[0] === 'Input.dispatchMouseEvent' && (c[1] as Record<string, unknown>).type === 'mousePressed',
+        (c: unknown[]) =>
+          c[0] === 'Input.dispatchMouseEvent' &&
+          (c[1] as Record<string, unknown>).type === 'mousePressed'
       );
       expect(pressCall).toBeDefined();
       expect((pressCall![1] as Record<string, unknown>).x).toBe(150); // 100 + 100/2
@@ -351,7 +513,7 @@ describe('BrowserAPI', () => {
 
       // Filter to Input.dispatchKeyEvent calls
       const keyCalls = (mockClient.send as ReturnType<typeof vi.fn>).mock.calls.filter(
-        (c: unknown[]) => c[0] === 'Input.dispatchKeyEvent',
+        (c: unknown[]) => c[0] === 'Input.dispatchKeyEvent'
       );
       expect(keyCalls).toHaveLength(4); // 2 chars × 2 events
       expect((keyCalls[0][1] as Record<string, unknown>).type).toBe('keyDown');
@@ -369,36 +531,32 @@ describe('BrowserAPI', () => {
 
     it('resolves when selector is found', async () => {
       let callCount = 0;
-      (mockClient.send as ReturnType<typeof vi.fn>).mockImplementation(
-        async (method: string) => {
-          if (method === 'Runtime.enable') return {};
-          if (method === 'Runtime.evaluate') {
-            callCount++;
-            // Found on the 2nd poll
-            return { result: { type: 'boolean', value: callCount >= 2 } };
-          }
-          return {};
-        },
-      );
+      (mockClient.send as ReturnType<typeof vi.fn>).mockImplementation(async (method: string) => {
+        if (method === 'Runtime.enable') return {};
+        if (method === 'Runtime.evaluate') {
+          callCount++;
+          // Found on the 2nd poll
+          return { result: { type: 'boolean', value: callCount >= 2 } };
+        }
+        return {};
+      });
 
       await api.waitForSelector('.target', { interval: 10 });
       expect(callCount).toBeGreaterThanOrEqual(2);
     });
 
     it('times out if selector never appears', async () => {
-      (mockClient.send as ReturnType<typeof vi.fn>).mockImplementation(
-        async (method: string) => {
-          if (method === 'Runtime.enable') return {};
-          if (method === 'Runtime.evaluate') {
-            return { result: { type: 'boolean', value: false } };
-          }
-          return {};
-        },
-      );
+      (mockClient.send as ReturnType<typeof vi.fn>).mockImplementation(async (method: string) => {
+        if (method === 'Runtime.enable') return {};
+        if (method === 'Runtime.evaluate') {
+          return { result: { type: 'boolean', value: false } };
+        }
+        return {};
+      });
 
-      await expect(
-        api.waitForSelector('.never', { timeout: 100, interval: 10 }),
-      ).rejects.toThrow('waitForSelector timed out');
+      await expect(api.waitForSelector('.never', { timeout: 100, interval: 10 })).rejects.toThrow(
+        'waitForSelector timed out'
+      );
     });
   });
 
@@ -444,6 +602,35 @@ describe('BrowserAPI', () => {
       const tree = await api.getAccessibilityTree();
       expect(tree.role).toBe('RootWebArea');
       expect(tree.name).toBe('');
+    });
+
+    it('normalizes non-string accessibility values', async () => {
+      (mockClient.send as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce({}) // Accessibility.enable
+        .mockResolvedValueOnce({
+          nodes: [
+            {
+              nodeId: '1',
+              role: { value: 'RootWebArea' },
+              name: { value: 'Slack' },
+              childIds: ['2'],
+            },
+            {
+              nodeId: '2',
+              role: { value: 'textbox' },
+              name: { value: { label: 'Message' } },
+              value: { value: 0 },
+              description: { value: ['composer'] },
+              parentId: '1',
+            },
+          ],
+        });
+
+      const tree = await api.getAccessibilityTree();
+      expect(tree.children).toHaveLength(1);
+      expect(tree.children![0].name).toBe('{"label":"Message"}');
+      expect(tree.children![0].value).toBe('0');
+      expect(tree.children![0].description).toBe('["composer"]');
     });
   });
 });

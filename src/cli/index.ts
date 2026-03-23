@@ -1,13 +1,50 @@
+#!/usr/bin/env node
 import { createServer } from 'http';
+import { createServer as createNetServer } from 'net';
 import { spawn, type ChildProcess } from 'child_process';
 import { existsSync } from 'fs';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
+import {
+  ElectronAppAlreadyRunningError,
+  ElectronOverlayInjector,
+  launchElectronApp,
+} from './electron-controller.js';
+import { getElectronAppPorts } from './electron-runtime.js';
+import {
+  buildChromeLaunchArgs,
+  ensureQaProfileScaffold,
+  findChromeExecutable,
+  resolveChromeLaunchProfile,
+  waitForCdpPortFromStderr,
+} from './chrome-launch.js';
+import { resolveCliBrowserLaunchUrl } from './launch-url.js';
+import { parseCliRuntimeFlags } from './runtime-flags.js';
+import { FileLogger } from './file-logger.js';
+import { CliLogDedup } from './cli-log-dedup.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const DEV_MODE = process.argv.includes('--dev');
+const PROJECT_ROOT = resolve(__dirname, '..', '..');
+const RUNTIME_FLAGS = parseCliRuntimeFlags(process.argv.slice(2));
+const DEV_MODE = RUNTIME_FLAGS.dev;
+const SERVE_ONLY = RUNTIME_FLAGS.serveOnly;
+const ELECTRON_MODE = RUNTIME_FLAGS.electron;
+const ELECTRON_APP = RUNTIME_FLAGS.electronApp;
+const KILL_EXISTING_ELECTRON_APP = RUNTIME_FLAGS.kill;
+
+// ---------------------------------------------------------------------------
+// File logger — persistent log file in ~/.slicc/logs/
+// ---------------------------------------------------------------------------
+const fileLogger = new FileLogger({
+  logDir: RUNTIME_FLAGS.logDir ?? undefined,
+  logLevel: RUNTIME_FLAGS.logLevel,
+  devMode: DEV_MODE,
+});
+if (fileLogger.logFile) {
+  console.log(`Log file: ${fileLogger.logFile}`);
+}
 
 // ---------------------------------------------------------------------------
 // Request logging middleware
@@ -29,48 +66,10 @@ function requestLogger(req: Request, res: Response, next: NextFunction) {
 }
 
 // ---------------------------------------------------------------------------
-// Chrome finder — checks common install paths per platform
-// ---------------------------------------------------------------------------
-
-function findChrome(): string | null {
-  const candidates: Record<string, string[]> = {
-    darwin: [
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    ],
-    linux: [
-      '/usr/bin/google-chrome',
-      '/usr/bin/google-chrome-stable',
-      '/usr/bin/chromium',
-      '/usr/bin/chromium-browser',
-      '/snap/bin/chromium',
-    ],
-    win32: [
-      `${process.env['LOCALAPPDATA']}\\Google\\Chrome\\Application\\chrome.exe`,
-      `${process.env['PROGRAMFILES']}\\Google\\Chrome\\Application\\chrome.exe`,
-      `${process.env['PROGRAMFILES(X86)']}\\Google\\Chrome\\Application\\chrome.exe`,
-    ],
-  };
-
-  const platform = process.platform;
-  const paths = candidates[platform] ?? [];
-
-  for (const p of paths) {
-    if (existsSync(p)) return p;
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
 // CDP helper — wait for the DevTools WebSocket endpoint to become available
 // ---------------------------------------------------------------------------
 
-async function waitForCDP(
-  port: number,
-  retries = 30,
-  delayMs = 500,
-): Promise<string> {
+async function waitForCDP(port: number, retries = 30, delayMs = 500): Promise<string> {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json/version`);
@@ -92,6 +91,62 @@ const ANSI_YELLOW = '\x1b[33m';
 const ANSI_CYAN = '\x1b[36m';
 const ANSI_RESET = '\x1b[0m';
 
+function pipeChildOutput(child: ChildProcess, label: string): void {
+  child.stdout?.on('data', (data: Buffer) => {
+    process.stdout.write(`[${label}:out] ${data}`);
+  });
+  child.stderr?.on('data', (data: Buffer) => {
+    process.stderr.write(`[${label}:err] ${data}`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Port selection — tries the preferred port, falls back to OS-assigned
+// ---------------------------------------------------------------------------
+
+function tryListenOnPort(port: number, host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createNetServer();
+    server.on('error', reject);
+    server.listen(port, host, () => {
+      const addr = server.address();
+      const assignedPort = addr && typeof addr === 'object' ? addr.port : port;
+      server.close(() => resolve(assignedPort));
+    });
+  });
+}
+
+/**
+ * Check that a port is free on both IPv4 (127.0.0.1) and IPv6 (::1).
+ * On macOS, `localhost` resolves to `::1`, so a server bound only on
+ * 127.0.0.1 is invisible to browsers connecting via `localhost`.
+ * Checking both address families avoids dual-stack port conflicts
+ * (e.g. a stale Vite process on `::1` while Express binds `127.0.0.1`).
+ */
+async function tryListenOnPortDualStack(port: number): Promise<number> {
+  const assignedPort = await tryListenOnPort(port, '127.0.0.1');
+  try {
+    await tryListenOnPort(assignedPort, '::1');
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+      throw Object.assign(new Error(`Port ${assignedPort} in use on IPv6`), { code: 'EADDRINUSE' });
+    }
+    // ::1 may not be available on some systems — ignore non-EADDRINUSE errors
+  }
+  return assignedPort;
+}
+
+async function findAvailablePort(preferred: number): Promise<number> {
+  try {
+    return await tryListenOnPortDualStack(preferred);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+      return tryListenOnPort(0, '127.0.0.1');
+    }
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CDP console forwarder — forwards in-page console output to CLI stdout
 // ---------------------------------------------------------------------------
@@ -109,15 +164,17 @@ interface RemoteObject {
 }
 
 function formatPreviewProperties(
-  properties: Array<{ name: string; type: string; value: string; subtype?: string }>,
+  properties: Array<{ name: string; type: string; value: string; subtype?: string }>
 ): string {
-  return properties.map((p) => {
-    let val: string;
-    if (p.type === 'object') val = p.subtype === 'array' ? '[...]' : '{...}';
-    else if (p.type === 'string') val = `"${p.value}"`;
-    else val = p.value;
-    return `${p.name}: ${val}`;
-  }).join(', ');
+  return properties
+    .map((p) => {
+      let val: string;
+      if (p.type === 'object') val = p.subtype === 'array' ? '[...]' : '{...}';
+      else if (p.type === 'string') val = `"${p.value}"`;
+      else val = p.value;
+      return `${p.name}: ${val}`;
+    })
+    .join(', ');
 }
 
 function formatRemoteObject(obj: RemoteObject): string {
@@ -140,15 +197,18 @@ function formatRemoteObject(obj: RemoteObject): string {
 
 function colorForType(type: string): string {
   switch (type) {
-    case 'error': return ANSI_RED;
-    case 'warning': return ANSI_YELLOW;
-    default: return ANSI_CYAN;
+    case 'error':
+      return ANSI_RED;
+    case 'warning':
+      return ANSI_YELLOW;
+    default:
+      return ANSI_CYAN;
   }
 }
 
 async function findPageTarget(
   cdpPort: number,
-  pageUrl: string,
+  pageUrl: string
 ): Promise<{ webSocketDebuggerUrl: string } | null> {
   try {
     const res = await fetch(`http://127.0.0.1:${cdpPort}/json`);
@@ -158,7 +218,7 @@ async function findPageTarget(
       webSocketDebuggerUrl?: string;
     }>;
     const match = targets.find(
-      (t) => t.type === 'page' && t.url.includes(`localhost:${pageUrl}`) && t.webSocketDebuggerUrl,
+      (t) => t.type === 'page' && t.url.includes(`localhost:${pageUrl}`) && t.webSocketDebuggerUrl
     );
     return match ? { webSocketDebuggerUrl: match.webSocketDebuggerUrl! } : null;
   } catch {
@@ -166,10 +226,8 @@ async function findPageTarget(
   }
 }
 
-async function attachConsoleForwarder(
-  cdpPort: number,
-  pageUrl: string,
-): Promise<void> {
+async function attachConsoleForwarder(cdpPort: number, pageUrl: string): Promise<void> {
+  const pageDedup = new CliLogDedup('[page]');
   const connect = async () => {
     // Poll for the page target
     let target: { webSocketDebuggerUrl: string } | null = null;
@@ -205,7 +263,10 @@ async function attachConsoleForwarder(
           const type = params.type;
           const color = colorForType(type);
           const argsStr = params.args.map(formatRemoteObject).join(' ');
-          console.log(`${color}[page:${type}]${ANSI_RESET} ${argsStr}`);
+          const line = `[page:${type}] ${argsStr}`;
+          if (pageDedup.shouldLog(line)) {
+            console.log(`${color}[page:${type}]${ANSI_RESET} ${argsStr}`);
+          }
         }
 
         if (msg.method === 'Runtime.exceptionThrown') {
@@ -230,7 +291,7 @@ async function attachConsoleForwarder(
             for (const frame of details.stackTrace.callFrames) {
               const fn = frame.functionName || '<anonymous>';
               console.log(
-                `${ANSI_RED}    at ${fn} (${frame.url}:${frame.lineNumber}:${frame.columnNumber})${ANSI_RESET}`,
+                `${ANSI_RED}    at ${fn} (${frame.url}:${frame.lineNumber}:${frame.columnNumber})${ANSI_RESET}`
               );
             }
           }
@@ -242,7 +303,9 @@ async function attachConsoleForwarder(
 
     ws.on('close', () => {
       // Reconnect after a short delay (page may have reloaded)
-      setTimeout(() => { connect(); }, 1000);
+      setTimeout(() => {
+        connect();
+      }, 1000);
     });
 
     ws.on('error', () => {
@@ -257,50 +320,264 @@ async function attachConsoleForwarder(
 // Main
 // ---------------------------------------------------------------------------
 
-const CDP_PORT = 9222;
-const SERVE_PORT = parseInt(process.env['PORT'] ?? '3000', 10);
+const PREFERRED_SERVE_PORT = parseInt(process.env['PORT'] ?? '5710', 10);
+const PREFERRED_CDP_PORT = RUNTIME_FLAGS.cdpPort;
+const PREFERRED_HMR_PORT = 24679;
 
 async function main() {
+  // Resolve available ports before anything else — serve port must be known
+  // before Chrome launches (the launch URL contains it).
+  let SERVE_PORT: number;
+  let CDP_PORT: number;
+  let REQUESTED_CDP_PORT: number;
+  let usingDynamicElectronPorts = false;
+
+  if (ELECTRON_MODE && ELECTRON_APP && !RUNTIME_FLAGS.explicitCdpPort) {
+    // Dynamic port allocation for Electron apps (hash-based with fallback)
+    const ports = await getElectronAppPorts(ELECTRON_APP);
+    CDP_PORT = ports.cdpPort;
+    SERVE_PORT = ports.servePort;
+    REQUESTED_CDP_PORT = CDP_PORT;
+    usingDynamicElectronPorts = true;
+  } else {
+    SERVE_PORT = await findAvailablePort(PREFERRED_SERVE_PORT);
+    // For Chrome CDP, we pass port 0 to let Chrome pick any available port,
+    // then parse the actual port from its stderr. This avoids race conditions
+    // where Node's port probe succeeds but Chrome still can't bind the port.
+    // Electron mode keeps the preferred port (external CDP, not launched by us).
+    REQUESTED_CDP_PORT = ELECTRON_MODE ? PREFERRED_CDP_PORT : 0;
+    CDP_PORT = ELECTRON_MODE ? PREFERRED_CDP_PORT : 0;
+  }
+
+  const HMR_PORT = DEV_MODE ? await findAvailablePort(PREFERRED_HMR_PORT) : PREFERRED_HMR_PORT;
+  const SERVE_ORIGIN = `http://localhost:${SERVE_PORT}`;
+
+  if (usingDynamicElectronPorts) {
+    console.log(`Dynamic port allocation for Electron app: CDP=${CDP_PORT}, serve=${SERVE_PORT}`);
+  } else if (SERVE_PORT !== PREFERRED_SERVE_PORT) {
+    console.log(`Port ${PREFERRED_SERVE_PORT} in use, serving on port ${SERVE_PORT}`);
+  }
+  if (DEV_MODE && HMR_PORT !== PREFERRED_HMR_PORT) {
+    console.log(`HMR port ${PREFERRED_HMR_PORT} in use, using port ${HMR_PORT}`);
+  }
+
   if (DEV_MODE) {
     console.log('Starting in dev mode (Vite HMR enabled)');
   }
-
-  // 1. Find Chrome
-  const chromePath = findChrome();
-  if (!chromePath) {
-    console.error(
-      'Could not find Chrome/Chromium. Please install Chrome or set CHROME_PATH.',
-    );
-    process.exit(1);
+  if (SERVE_ONLY) {
+    console.log(`Starting in serve-only mode (reusing external CDP on port ${CDP_PORT})`);
   }
-  console.log(`Found Chrome: ${chromePath}`);
+  if (ELECTRON_MODE) {
+    console.log('Starting in Electron mode');
+  }
 
-  // 2. Launch Chrome with remote debugging — forward stdout/stderr
-  const chromeArgs = [
-    `--remote-debugging-port=${CDP_PORT}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    `--user-data-dir=${join(process.env['TMPDIR'] ?? '/tmp', 'browser-coding-agent-chrome')}`,
-    `http://localhost:${SERVE_PORT}`,
-  ];
+  let launchedBrowserProcess: ChildProcess | null = null;
+  let launchedBrowserLabel = 'Browser';
+  let overlayInjector: ElectronOverlayInjector | null = null;
+  let shuttingDown = false;
+  // Tray join URL discovered from an existing leader on the preferred port.
+  // Populated in Electron mode when auto-discovering the leader's tray.
+  let discoveredTrayJoinUrl: string | null = RUNTIME_FLAGS.joinUrl ?? null;
 
-  const chrome: ChildProcess = spawn(chromePath, chromeArgs, {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false,
-  });
+  // 1. Launch Chrome unless an external CDP provider is already running.
+  if (ELECTRON_MODE && !SERVE_ONLY) {
+    if (!ELECTRON_APP) {
+      console.error(
+        'Electron mode requires an app path. Pass --electron <path> or --electron-app=<path>.'
+      );
+      process.exit(1);
+    }
 
-  // Forward Chrome's stdout/stderr so we can see console output and errors
-  chrome.stdout?.on('data', (data: Buffer) => {
-    process.stdout.write(`[chrome:out] ${data}`);
-  });
-  chrome.stderr?.on('data', (data: Buffer) => {
-    process.stderr.write(`[chrome:err] ${data}`);
-  });
+    try {
+      const { child, displayName } = await launchElectronApp({
+        appPath: ELECTRON_APP,
+        cdpPort: CDP_PORT,
+        kill: KILL_EXISTING_ELECTRON_APP,
+      });
 
-  chrome.on('exit', (code) => {
-    console.log(`Chrome exited with code ${code}`);
-    process.exit(0);
-  });
+      launchedBrowserProcess = child;
+      launchedBrowserLabel = displayName;
+      pipeChildOutput(child, 'electron-app');
+
+      // Track when app exits - quick exits before CDP connects indicate a problem
+      let cdpConnected = false;
+      let exitCode: number | null = null;
+      let exitResolve: (() => void) | null = null;
+      const exitPromise = new Promise<void>((resolve) => {
+        exitResolve = resolve;
+      });
+
+      child.on('exit', (code) => {
+        exitCode = code;
+        exitResolve?.();
+        if (shuttingDown) return;
+        if (cdpConnected) {
+          // Normal exit after we connected
+          console.log(`${displayName} exited with code ${code}`);
+          process.exit(0);
+        }
+        // If CDP not yet connected, don't exit - let waitForCDP handle it
+      });
+
+      console.log(`Waiting for ${displayName} CDP on port ${CDP_PORT}...`);
+      try {
+        // Race between CDP connection and app exit
+        await Promise.race([
+          waitForCDP(CDP_PORT, 40, 500).then(() => {
+            cdpConnected = true;
+          }),
+          exitPromise.then(() => {
+            if (!cdpConnected) {
+              throw new Error('app-exited');
+            }
+          }),
+        ]);
+      } catch (err) {
+        // Check if app exited quickly (likely due to disabled remote debugging fuse)
+        if (exitCode !== null) {
+          console.error(
+            `\n${displayName} exited with code ${exitCode} before remote debugging was available.`
+          );
+          console.error(
+            'This usually means the app has disabled remote debugging (EnableNodeCliInspectArguments fuse).'
+          );
+          console.error(
+            'Some Electron apps disable this for security. Check if there is a developer/debug build available.\n'
+          );
+          process.exit(1);
+        }
+        throw new Error(`Could not connect to ${displayName} CDP on port ${CDP_PORT}`);
+      }
+      console.log(`Connected to ${displayName} on CDP port ${CDP_PORT}`);
+
+      // Auto-discover leader's tray join URL when another instance runs on the preferred port.
+      // The leader may still be creating its tray session, so retry a few times.
+      if (!discoveredTrayJoinUrl && SERVE_PORT !== PREFERRED_SERVE_PORT) {
+        const leaderOrigin = `http://localhost:${PREFERRED_SERVE_PORT}`;
+        for (let attempt = 0; attempt < 5 && !discoveredTrayJoinUrl; attempt++) {
+          try {
+            const resp = await fetch(`${leaderOrigin}/api/tray-status`, {
+              signal: AbortSignal.timeout(3000),
+            });
+            if (resp.ok) {
+              const status = (await resp.json()) as { state?: string; joinUrl?: string | null };
+              if (status.joinUrl) {
+                discoveredTrayJoinUrl = status.joinUrl;
+                console.log(`Discovered leader tray join URL: ${status.joinUrl}`);
+              } else if (status.state === 'connecting') {
+                // Leader is still setting up — wait and retry
+                await new Promise((r) => setTimeout(r, 2000));
+              } else {
+                console.log(
+                  `Leader on port ${PREFERRED_SERVE_PORT} has no active tray (state: ${status.state ?? 'unknown'})`
+                );
+                break;
+              }
+            } else {
+              break;
+            }
+          } catch {
+            // Leader not reachable or no tray status endpoint — continue without tray
+            break;
+          }
+        }
+      }
+    } catch (error: unknown) {
+      if (error instanceof ElectronAppAlreadyRunningError) {
+        console.error(error.message);
+        process.exit(1);
+      }
+      throw error;
+    }
+  } else if (!SERVE_ONLY) {
+    let browserLaunchUrl = resolveCliBrowserLaunchUrl({
+      serveOrigin: SERVE_ORIGIN,
+      lead: RUNTIME_FLAGS.lead,
+      leadWorkerBaseUrl: RUNTIME_FLAGS.leadWorkerBaseUrl,
+      envWorkerBaseUrl: process.env['WORKER_BASE_URL'] ?? null,
+      join: RUNTIME_FLAGS.join,
+      joinUrl: RUNTIME_FLAGS.joinUrl,
+    });
+    // Append optional prompt parameter
+    if (RUNTIME_FLAGS.prompt) {
+      const sep = browserLaunchUrl.includes('?') ? '&' : '?';
+      browserLaunchUrl += `${sep}prompt=${encodeURIComponent(RUNTIME_FLAGS.prompt)}`;
+    }
+    if (RUNTIME_FLAGS.join) {
+      console.log(`Join launch URL: ${browserLaunchUrl}`);
+    } else if (RUNTIME_FLAGS.lead) {
+      console.log(`Lead launch URL: ${browserLaunchUrl}`);
+    }
+
+    const chromeProfile = (() => {
+      try {
+        return resolveChromeLaunchProfile({
+          projectRoot: PROJECT_ROOT,
+          tmpDir: process.env['TMPDIR'] ?? '/tmp',
+          profile: RUNTIME_FLAGS.profile,
+        });
+      } catch (error: unknown) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+      }
+
+      throw new Error('unreachable');
+    })();
+
+    const chromePath = findChromeExecutable({
+      executablePreference: !DEV_MODE && !chromeProfile.id ? 'installed' : 'chrome-for-testing',
+    });
+    if (!chromePath) {
+      console.error('Could not find Chrome/Chromium. Please install Chrome or set CHROME_PATH.');
+      process.exit(1);
+    }
+    console.log(`Found Chrome: ${chromePath}`);
+
+    if (chromeProfile.id) {
+      await ensureQaProfileScaffold(PROJECT_ROOT);
+    }
+
+    if (chromeProfile.extensionPath && !existsSync(chromeProfile.extensionPath)) {
+      console.error(
+        `Extension profile requires ${chromeProfile.extensionPath}. Run \`npm run qa:setup\` or \`npm run build:extension\` first.`
+      );
+      process.exit(1);
+    }
+
+    if (chromeProfile.id) {
+      console.log(`Using QA Chrome profile: ${chromeProfile.id}`);
+      console.log(`Profile directory: ${chromeProfile.userDataDir}`);
+      if (chromeProfile.extensionPath) {
+        console.log(`Auto-loading unpacked extension from ${chromeProfile.extensionPath}`);
+      }
+    }
+
+    const chromeArgs = buildChromeLaunchArgs({
+      cdpPort: REQUESTED_CDP_PORT,
+      launchUrl: browserLaunchUrl,
+      profile: chromeProfile,
+    });
+
+    launchedBrowserProcess = spawn(chromePath, chromeArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
+    });
+    launchedBrowserLabel = chromeProfile.displayName;
+
+    // Parse the actual CDP port from Chrome's stderr before piping output.
+    // Chrome prints "DevTools listening on ws://HOST:PORT/..." to stderr.
+    const actualCdpPort = await waitForCdpPortFromStderr(launchedBrowserProcess);
+    CDP_PORT = actualCdpPort;
+    console.log(`Chrome CDP listening on port ${CDP_PORT}`);
+
+    pipeChildOutput(launchedBrowserProcess, 'chrome');
+
+    launchedBrowserProcess.on('exit', (code) => {
+      if (shuttingDown) return;
+      console.log(`Chrome exited with code ${code}`);
+      process.exit(0);
+    });
+  }
 
   // 3. Set up express app with request logging
   const app = express();
@@ -309,11 +586,14 @@ async function main() {
   // ---------------------------------------------------------------------------
   // Lick system — WebSocket bridge for webhooks/crontasks (all logic in browser)
   // ---------------------------------------------------------------------------
-  
+
   // WebSocket for bidirectional communication with browser
   const lickWss = new WebSocketServer({ noServer: true });
   const lickClients = new Set<WebSocket>();
-  const pendingRequests = new Map<string, { resolve: (data: unknown) => void; reject: (err: Error) => void }>();
+  const pendingRequests = new Map<
+    string,
+    { resolve: (data: unknown) => void; reject: (err: Error) => void }
+  >();
   let requestIdCounter = 0;
 
   lickWss.on('connection', (ws) => {
@@ -322,8 +602,12 @@ async function main() {
 
     ws.on('message', (data) => {
       try {
-        const msg = JSON.parse(data.toString()) as { type: string; requestId?: string; [key: string]: unknown };
-        
+        const msg = JSON.parse(data.toString()) as {
+          type: string;
+          requestId?: string;
+          [key: string]: unknown;
+        };
+
         // Handle responses to pending requests
         if (msg.type === 'response' && msg.requestId) {
           const pending = pendingRequests.get(msg.requestId);
@@ -351,10 +635,10 @@ async function main() {
   function sendLickRequest(type: string, data: unknown, timeout = 5000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const requestId = `req_${++requestIdCounter}`;
-      const msg = JSON.stringify({ type, requestId, ...data as object });
+      const msg = JSON.stringify({ type, requestId, ...(data as object) });
 
       // Find a connected client
-      const client = Array.from(lickClients).find(c => c.readyState === WebSocket.OPEN);
+      const client = Array.from(lickClients).find((c) => c.readyState === WebSocket.OPEN);
       if (!client) {
         reject(new Error('No browser connected'));
         return;
@@ -391,7 +675,83 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // OAuth callback — generic redirect target for OAuth providers (implicit + PKCE)
+  // ---------------------------------------------------------------------------
+  // Pending OAuth result for server-side relay (Electron overlay can't use window.opener)
+  let pendingOAuthResult: { redirectUrl: string; error?: string } | null = null;
+
+  app.get('/auth/callback', (_req: Request, res: Response) => {
+    // The callback page tries window.opener.postMessage first (works in CLI popup mode).
+    // If window.opener is null (Electron overlay — opens system browser), it falls back
+    // to POSTing the result to /api/oauth-result for the UI to poll.
+    res.send(`<!DOCTYPE html><html><body><script>
+      var q = new URLSearchParams(location.search);
+      var h = new URLSearchParams(location.hash.replace(/^#/, ''));
+      var payload = {
+        type: 'oauth-callback',
+        redirectUrl: location.href,
+        code: q.get('code'),
+        state: q.get('state') || h.get('state'),
+        error: q.get('error') || h.get('error'),
+        access_token: h.get('access_token'),
+        expires_in: h.get('expires_in'),
+        token_type: h.get('token_type')
+      };
+      if (window.opener) {
+        window.opener.postMessage(payload, '*');
+      } else {
+        fetch('/api/oauth-result', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }).catch(function(err) { console.error('[oauth-callback] Failed to relay result to server:', err); });
+      }
+      window.close();
+    </script><p>Completing login... you can close this window.</p></body></html>`);
+  });
+
+  app.post('/api/oauth-result', express.json(), (req: Request, res: Response) => {
+    const body = req.body as Record<string, unknown>;
+    const redirectUrl = typeof body.redirectUrl === 'string' ? body.redirectUrl : '';
+    if (!redirectUrl) {
+      console.warn('[oauth-result] Received callback with empty redirectUrl');
+    }
+    pendingOAuthResult = {
+      redirectUrl,
+      error: typeof body.error === 'string' ? body.error : undefined,
+    };
+    res.json({ ok: true });
+  });
+
+  app.get('/api/oauth-result', (_req: Request, res: Response) => {
+    if (pendingOAuthResult) {
+      const result = pendingOAuthResult;
+      pendingOAuthResult = null;
+      res.json(result);
+    } else {
+      res.status(204).end();
+    }
+  });
+
   app.use(express.json({ limit: '50mb' }));
+
+  app.get('/api/runtime-config', (_req, res) => {
+    res.json({
+      trayWorkerBaseUrl: RUNTIME_FLAGS.leadWorkerBaseUrl ?? process.env['WORKER_BASE_URL'] ?? null,
+      trayJoinUrl: discoveredTrayJoinUrl ?? null,
+    });
+  });
+
+  // Tray status API — forwards to browser to get leader tray join info
+  app.get('/api/tray-status', async (_req, res) => {
+    try {
+      const data = await sendLickRequest('tray_status', {});
+      res.json(data);
+    } catch (err) {
+      res.status(503).json({ error: err instanceof Error ? err.message : 'Browser not connected' });
+    }
+  });
 
   // Webhook management API — forwards to browser
   app.get('/api/webhooks', async (_req, res) => {
@@ -415,7 +775,10 @@ async function main() {
 
   app.delete('/api/webhooks/:id', async (req, res) => {
     try {
-      const data = await sendLickRequest('delete_webhook', { id: req.params.id }) as { ok?: boolean; error?: string };
+      const data = (await sendLickRequest('delete_webhook', { id: req.params.id })) as {
+        ok?: boolean;
+        error?: string;
+      };
       if (data.error) {
         res.status(404).json({ error: data.error });
       } else {
@@ -484,13 +847,18 @@ async function main() {
       res.json(data);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      res.status(msg.includes('Invalid') || msg.includes('required') ? 400 : 503).json({ error: msg });
+      res
+        .status(msg.includes('Invalid') || msg.includes('required') ? 400 : 503)
+        .json({ error: msg });
     }
   });
 
   app.delete('/api/crontasks/:id', async (req, res) => {
     try {
-      const data = await sendLickRequest('delete_crontask', { id: req.params.id }) as { ok?: boolean; error?: string };
+      const data = (await sendLickRequest('delete_crontask', { id: req.params.id })) as {
+        ok?: boolean;
+        error?: string;
+      };
       if (data.error) {
         res.status(404).json({ error: data.error });
       } else {
@@ -529,16 +897,28 @@ async function main() {
         redirect: 'follow', // Follow redirects for git protocol compatibility
       };
       // Forward relevant headers (excluding hop-by-hop and proxy headers)
-      const skipHeaders = new Set(['host', 'connection', 'x-target-url', 'content-length', 'transfer-encoding']);
+      const skipHeaders = new Set([
+        'host',
+        'connection',
+        'x-target-url',
+        'content-length',
+        'transfer-encoding',
+      ]);
       const headers: Record<string, string> = {};
       for (const [key, value] of Object.entries(req.headers)) {
         if (!skipHeaders.has(key) && typeof value === 'string') {
           headers[key] = value;
         }
       }
+      // Always request uncompressed responses from upstream — the proxy doesn't
+      // decompress, and the browser→proxy link is localhost (no benefit to compression).
+      // Without this, Cloudflare may Brotli-compress the response, the proxy strips
+      // Content-Encoding (line below), and the browser receives compressed garbage.
+      headers['accept-encoding'] = 'identity';
       if (Object.keys(headers).length > 0) fetchInit.headers = headers;
       if (rawBody.length > 0 && !['GET', 'HEAD'].includes(req.method)) {
-        fetchInit.body = rawBody;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        fetchInit.body = rawBody as any;
       }
 
       const upstream = await fetch(targetUrl, fetchInit);
@@ -547,15 +927,21 @@ async function main() {
       res.status(upstream.status);
       res.setHeader('Cache-Control', 'no-store, no-cache');
 
-      // Forward response headers
+      // Forward response headers (strip www-authenticate to prevent
+      // the browser from showing a native Basic Auth dialog — isomorphic-git
+      // handles 401s through its own onAuth callback)
       upstream.headers.forEach((v, k) => {
         const lower = k.toLowerCase();
-        if (lower !== 'transfer-encoding' && lower !== 'content-encoding') {
+        if (
+          lower !== 'transfer-encoding' &&
+          lower !== 'content-encoding' &&
+          lower !== 'www-authenticate'
+        ) {
           res.setHeader(k, v);
         }
       });
 
-      // Send body as raw binary - explicitly set content-length and use end() 
+      // Send body as raw binary - explicitly set content-length and use end()
       // instead of send() to avoid any Express middleware transformations
       const body = await upstream.arrayBuffer();
       const buffer = Buffer.from(body);
@@ -577,13 +963,13 @@ async function main() {
       server: {
         middlewareMode: true,
         hmr: {
-          port: 24679, // Use a separate port for HMR WebSocket to avoid conflicting with /cdp
+          port: HMR_PORT, // Use a separate port for HMR WebSocket to avoid conflicting with /cdp
         },
       },
       root: process.cwd(),
     });
     app.use(vite.middlewares);
-    console.log('Vite dev server middleware attached (HMR active on port 24679)');
+    console.log(`Vite dev server middleware attached (HMR active on port ${HMR_PORT})`);
   } else {
     // Production mode: serve built static files
     const uiDir = resolve(__dirname, '..', 'ui');
@@ -622,21 +1008,33 @@ async function main() {
   let chromeWs: WebSocket | null = null;
   let activeClientWs: WebSocket | null = null;
   let messageBuffer: unknown[] | null = null;
+  const cdpDedup = new CliLogDedup();
 
   // Ensure everything is cleaned up when CLI exits
-  let shuttingDown = false;
   const gracefulShutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log('\nShutting down...');
+    fileLogger.close();
+
+    overlayInjector?.stop();
+    overlayInjector = null;
 
     // Close the shared Chrome WebSocket and all client connections
     if (chromeWs) {
-      try { chromeWs.close(); } catch { /* ignore */ }
+      try {
+        chromeWs.close();
+      } catch {
+        /* ignore */
+      }
       chromeWs = null;
     }
     if (activeClientWs) {
-      try { activeClientWs.close(); } catch { /* ignore */ }
+      try {
+        activeClientWs.close();
+      } catch {
+        /* ignore */
+      }
       activeClientWs = null;
     }
     for (const client of wss.clients) {
@@ -647,47 +1045,59 @@ async function main() {
     // Stop accepting new HTTP connections
     server.close();
 
-    // Try to close Chrome gracefully via CDP Browser.close
-    let chromeExited = false;
-    chrome.on('exit', () => { chromeExited = true; });
-
-    try {
-      const res = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`);
-      const json = (await res.json()) as { webSocketDebuggerUrl: string };
-      const browserWs = new WebSocket(json.webSocketDebuggerUrl);
-      await new Promise<void>((resolve, reject) => {
-        browserWs.on('open', () => {
-          browserWs.send(JSON.stringify({ id: 1, method: 'Browser.close' }));
-          resolve();
-        });
-        browserWs.on('error', reject);
+    if (launchedBrowserProcess) {
+      let browserExited = false;
+      launchedBrowserProcess.on('exit', () => {
+        browserExited = true;
       });
-    } catch {
-      // CDP not available — Chrome may still be starting up; fall through to kill
-    }
 
-    // Wait up to 3 seconds for Chrome to exit, then force-kill
-    const deadline = Date.now() + 3000;
-    while (!chromeExited && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-
-    if (!chromeExited) {
       try {
-        chrome.kill('SIGKILL');
-      } catch { /* ignore */ }
-    }
+        const res = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`);
+        const json = (await res.json()) as { webSocketDebuggerUrl: string };
+        const browserWs = new WebSocket(json.webSocketDebuggerUrl);
+        await new Promise<void>((resolve, reject) => {
+          browserWs.on('open', () => {
+            browserWs.send(JSON.stringify({ id: 1, method: 'Browser.close' }));
+            resolve();
+          });
+          browserWs.on('error', reject);
+        });
+      } catch {
+        // CDP not available — the launched browser may still be starting up; fall through to kill.
+      }
 
-    console.log('Chrome closed');
+      const deadline = Date.now() + 3000;
+      while (!browserExited && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      if (!browserExited) {
+        try {
+          launchedBrowserProcess.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }
+
+      console.log(`${launchedBrowserLabel} closed`);
+    }
     process.exit(0);
   };
 
-  process.on('SIGINT', () => { gracefulShutdown(); });
-  process.on('SIGTERM', () => { gracefulShutdown(); });
+  process.on('SIGINT', () => {
+    gracefulShutdown();
+  });
+  process.on('SIGTERM', () => {
+    gracefulShutdown();
+  });
   process.on('exit', () => {
-    // Synchronous last-resort cleanup — kill Chrome if still running
-    if (!shuttingDown) {
-      try { chrome.kill(); } catch { /* ignore */ }
+    // Synchronous last-resort cleanup — kill the launched browser if it is still running.
+    if (!shuttingDown && launchedBrowserProcess) {
+      try {
+        launchedBrowserProcess.kill();
+      } catch {
+        /* ignore */
+      }
     }
   });
 
@@ -706,7 +1116,11 @@ async function main() {
       }
       // Clean up old connection
       if (chromeWs) {
-        try { chromeWs.close(); } catch { /* ignore */ }
+        try {
+          chromeWs.close();
+        } catch {
+          /* ignore */
+        }
       }
 
       messageBuffer = [];
@@ -726,7 +1140,8 @@ async function main() {
 
       chromeWs.on('message', (data) => {
         const preview = String(data).slice(0, 200);
-        console.log(`[cdp-proxy] Chrome→Client: ${preview}`);
+        const msg = `[cdp-proxy] Chrome→Client: ${preview}`;
+        if (cdpDedup.shouldLog(msg)) console.debug(msg);
         if (activeClientWs && activeClientWs.readyState === WebSocket.OPEN) {
           activeClientWs.send(String(data));
         }
@@ -766,11 +1181,13 @@ async function main() {
       clientWs.on('message', (data) => {
         const preview = String(data).slice(0, 200);
         if (chromeWs && chromeWs.readyState === WebSocket.OPEN && messageBuffer === null) {
-          console.log(`[cdp-proxy] Client→Chrome: ${preview}`);
+          const msg = `[cdp-proxy] Client→Chrome: ${preview}`;
+          if (cdpDedup.shouldLog(msg)) console.debug(msg);
           chromeWs.send(String(data));
         } else if (messageBuffer !== null) {
           messageBuffer.push(data);
-          console.log(`[cdp-proxy] Client→Chrome (buffered): ${preview}`);
+          const msg = `[cdp-proxy] Client→Chrome (buffered): ${preview}`;
+          if (cdpDedup.shouldLog(msg)) console.debug(msg);
         } else {
           // Chrome not connected and no buffer — this shouldn't happen but log it
           console.log(`[cdp-proxy] Client→Chrome (DROPPED — no connection): ${preview}`);
@@ -805,12 +1222,18 @@ async function main() {
     }
   });
 
-  server.listen(SERVE_PORT, () => {
-    console.log(`Serving UI at http://localhost:${SERVE_PORT}`);
+  server.listen(SERVE_PORT, '127.0.0.1', () => {
+    console.log(`Serving UI at ${SERVE_ORIGIN}`);
     console.log(`CDP proxy at ws://localhost:${SERVE_PORT}/cdp`);
+    fileLogger.log('info', 'CLI server started', {
+      port: SERVE_PORT,
+      cdpPort: CDP_PORT,
+      devMode: DEV_MODE,
+      electronMode: ELECTRON_MODE,
+    });
 
     // Pre-connect to Chrome's CDP so the proxy is warm when the first client connects.
-    // Without this, the first browser tool call has to wait for CDP discovery + WS handshake.
+    // Without this, the first browser automation command has to wait for CDP discovery + WS handshake.
     (async () => {
       try {
         cdpUrl = await waitForCDP(CDP_PORT);
@@ -822,16 +1245,41 @@ async function main() {
       }
     })();
 
-    // Attach console forwarder after a delay to let Chrome load the page
-    setTimeout(() => {
-      attachConsoleForwarder(CDP_PORT, String(SERVE_PORT)).catch((err) => {
-        console.error('[page] Console forwarder error:', err);
-      });
-    }, 2500);
+    if (ELECTRON_MODE) {
+      void (async () => {
+        try {
+          overlayInjector = await ElectronOverlayInjector.create({
+            cdpPort: CDP_PORT,
+            servePort: SERVE_PORT,
+            dev: DEV_MODE,
+            projectRoot: PROJECT_ROOT,
+          });
+          await overlayInjector.start();
+          console.log('[electron-float] Overlay injector is watching Electron page targets');
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[electron-float] Failed to start overlay injector:', message);
+        }
+      })();
+    }
+
+    if (!ELECTRON_MODE) {
+      setTimeout(() => {
+        attachConsoleForwarder(CDP_PORT, String(SERVE_PORT)).catch((err) => {
+          console.error('[page] Console forwarder error:', err);
+        });
+      }, 2500);
+    }
   });
 }
 
 main().catch((err) => {
   console.error('Fatal error:', err);
+  const errorData =
+    err instanceof Error
+      ? { name: err.name, message: err.message, stack: err.stack }
+      : { value: String(err) };
+  fileLogger.log('error', 'Fatal error', errorData);
+  fileLogger.close();
   process.exit(1);
 });

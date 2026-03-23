@@ -8,7 +8,73 @@
  */
 
 import type { AgentTool, AgentToolResult } from '@mariozechner/pi-agent-core';
-import type { ToolDefinition } from './types.js';
+import type { ToolDefinition, ImageContent, TextContent } from './types.js';
+import { processImageContent } from './image-processor.js';
+import { createLogger } from './logger.js';
+import {
+  pushToolExecutionContext,
+  popToolExecutionContext,
+  type ToolExecutionContext,
+} from '../tools/tool-ui.js';
+
+const log = createLogger('tool-adapter');
+
+/** Regex to match `<img:data:image/TYPE;base64,DATA>` tags in tool result text. */
+const IMG_TAG_RE = /<img:(data:(image\/[^;]+);base64,([^>]+))>/g;
+
+/**
+ * Parse a tool result string, extracting `<img:...>` tags into ImageContent blocks.
+ * Sync version — extracts tags without image processing.
+ */
+export function parseToolResultContentRaw(text: string): (TextContent | ImageContent)[] {
+  const blocks: (TextContent | ImageContent)[] = [];
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(IMG_TAG_RE)) {
+    // Add any text before this match
+    const before = text.slice(lastIndex, match.index);
+    if (before.trim()) {
+      blocks.push({ type: 'text', text: before.trimEnd() });
+    }
+    // Add the image as a proper content block
+    blocks.push({
+      type: 'image',
+      mimeType: match[2],
+      data: match[3],
+    });
+    lastIndex = match.index! + match[0].length;
+  }
+
+  // Add any remaining text after the last match
+  const remaining = text.slice(lastIndex);
+  if (remaining.trim() || blocks.length === 0) {
+    blocks.push({ type: 'text', text: remaining || text });
+  }
+
+  return blocks;
+}
+
+/**
+ * Parse a tool result string, extracting `<img:...>` tags into ImageContent blocks,
+ * then validate and resize any images that exceed API limits.
+ */
+export async function parseToolResultContent(
+  text: string
+): Promise<(TextContent | ImageContent)[]> {
+  const raw = parseToolResultContentRaw(text);
+
+  // Process each image block through validation/resize
+  const processed: (TextContent | ImageContent)[] = [];
+  for (const block of raw) {
+    if (block.type === 'image') {
+      processed.push(await processImageContent(block));
+    } else {
+      processed.push(block);
+    }
+  }
+
+  return processed;
+}
 
 /**
  * Wrap a legacy ToolDefinition as a pi-compatible AgentTool.
@@ -20,16 +86,39 @@ export function adaptTool(tool: ToolDefinition): AgentTool<any> {
     description: tool.description,
     parameters: tool.inputSchema as any,
     async execute(
-      _toolCallId: string,
+      toolCallId: string,
       params: Record<string, any>,
       _signal?: AbortSignal,
-      _onUpdate?: (partialResult: AgentToolResult<any>) => void,
+      onUpdate?: (partialResult: AgentToolResult<any>) => void
     ): Promise<AgentToolResult<any>> {
-      const result = await tool.execute(params);
-      return {
-        content: [{ type: 'text', text: result.content }],
-        details: { isError: result.isError },
-      };
+      // Push execution context so shell commands can show UI if needed
+      let ctx: ToolExecutionContext | undefined;
+      if (onUpdate) {
+        ctx = pushToolExecutionContext({ onUpdate, toolName: tool.name, toolCallId });
+      }
+
+      try {
+        const result = await tool.execute(params);
+        let content: (TextContent | ImageContent)[];
+        try {
+          content = await parseToolResultContent(result.content);
+        } catch (err) {
+          log.warn('Image processing failed, falling back to raw content', {
+            tool: tool.name,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          content = parseToolResultContentRaw(result.content);
+        }
+        return {
+          content,
+          details: { isError: result.isError },
+        };
+      } finally {
+        // Pop execution context
+        if (ctx) {
+          popToolExecutionContext(ctx);
+        }
+      }
     },
   };
 }

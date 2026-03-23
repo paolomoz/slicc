@@ -9,15 +9,23 @@
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
 import type { VirtualFS } from '../fs/index.js';
-import { Bash, defineCommand } from 'just-bash';
+import { Bash, defineCommand, getCommandNames, getNetworkCommandNames } from 'just-bash';
 import type { BashExecResult, SecureFetch, Command } from 'just-bash';
 import { VfsAdapter } from './vfs-adapter.js';
 import { cacheBinaryBody, cacheBinaryByUrl } from './binary-cache.js';
 import { GitCommands } from '../git/git-commands.js';
 import { createSupplementalCommands } from './supplemental-commands.js';
 import type { MediaPreviewItem } from './supplemental-commands.js';
-import { createSkillCommand, createUpskillCommand } from './supplemental-commands/upskill-command.js';
+import type { BrowserAPI } from '../cdp/index.js';
+import {
+  createSkillCommand,
+  createUpskillCommand,
+} from './supplemental-commands/upskill-command.js';
 import { MountCommands } from '../fs/mount-commands.js';
+import { discoverJshCommands } from './jsh-discovery.js';
+import { executeJshFile } from './jsh-executor.js';
+import { parseShellArgs } from './parse-shell-args.js';
+import { trackShellCommand } from '../ui/telemetry.js';
 
 function basename(path: string): string {
   const trimmed = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
@@ -29,14 +37,16 @@ function basename(path: string): string {
 export function isTextContentType(contentType: string): boolean {
   if (!contentType) return true; // Default to text for unknown types
   const ct = contentType.toLowerCase();
-  return ct.startsWith('text/') ||
+  return (
+    ct.startsWith('text/') ||
     ct.includes('json') ||
     ct.includes('xml') ||
     ct.includes('javascript') ||
     ct.includes('ecmascript') ||
     ct.includes('html') ||
     ct.includes('css') ||
-    ct.includes('svg');
+    ct.includes('svg')
+  );
 }
 
 /**
@@ -77,6 +87,22 @@ async function readResponseBody(resp: Response, url?: string): Promise<string> {
  * Binary responses (images, archives, etc.) are encoded as latin1 strings
  * to preserve byte fidelity through just-bash's string-typed FetchResult.
  */
+// Multipart form bodies contain latin1-encoded binary file content from curl —
+// convert to raw bytes so fetch() doesn't re-encode as UTF-8.
+function prepareRequestBody(
+  body: string | undefined,
+  headers?: Record<string, string>
+): BodyInit | undefined {
+  if (!body) return undefined;
+  const ct = headers?.['Content-Type'] ?? headers?.['content-type'] ?? '';
+  if (ct.includes('multipart/form-data')) {
+    const bytes = new Uint8Array(body.length);
+    for (let i = 0; i < body.length; i++) bytes[i] = body.charCodeAt(i);
+    return bytes;
+  }
+  return body;
+}
+
 function createProxiedFetch(): SecureFetch {
   const isExtension = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
 
@@ -86,11 +112,13 @@ function createProxiedFetch(): SecureFetch {
       const resp = await fetch(url, {
         method: options?.method ?? 'GET',
         headers: options?.headers,
-        body: options?.body,
+        body: prepareRequestBody(options?.body, options?.headers),
       });
       const body = await readResponseBody(resp, url);
       const respHeaders: Record<string, string> = {};
-      resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+      resp.headers.forEach((v, k) => {
+        respHeaders[k] = v;
+      });
       return { status: resp.status, statusText: resp.statusText, headers: respHeaders, body, url };
     };
   }
@@ -105,7 +133,7 @@ function createProxiedFetch(): SecureFetch {
 
     const init: RequestInit = { method, headers, cache: 'no-store' };
     if (options?.body && !['GET', 'HEAD'].includes(method)) {
-      init.body = options.body;
+      init.body = prepareRequestBody(options.body, headers);
     }
 
     const resp = await fetch('/api/fetch-proxy', init);
@@ -114,13 +142,19 @@ function createProxiedFetch(): SecureFetch {
     if (resp.status === 502 || resp.status === 400) {
       const errorText = await resp.text();
       let errorMsg = `Proxy error ${resp.status}`;
-      try { errorMsg = JSON.parse(errorText).error ?? errorMsg; } catch { /* not JSON */ }
+      try {
+        errorMsg = JSON.parse(errorText).error ?? errorMsg;
+      } catch {
+        /* not JSON */
+      }
       throw new Error(errorMsg);
     }
 
     const body = await readResponseBody(resp, url);
     const respHeaders: Record<string, string> = {};
-    resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+    resp.headers.forEach((v, k) => {
+      respHeaders[k] = v;
+    });
 
     return { status: resp.status, statusText: resp.statusText, headers: respHeaders, body, url };
   };
@@ -134,6 +168,8 @@ export interface WasmShellOptions {
   cwd?: string;
   /** Initial environment variables. */
   env?: Record<string, string>;
+  /** BrowserAPI for playwright-cli command. */
+  browserAPI?: BrowserAPI;
 }
 
 export class WasmShell {
@@ -149,6 +185,7 @@ export class WasmShell {
   private previewStateListener: ((hasPreview: boolean) => void) | null = null;
   private hasPreview = false;
   private resizeObserver: ResizeObserver | null = null;
+  private themeObserver: MutationObserver | null = null;
   private currentLine = '';
   private cursorPos = 0;
   private history: string[] = [];
@@ -158,6 +195,8 @@ export class WasmShell {
   /** Accumulated env state from successive exec() calls. */
   private lastEnv: Record<string, string>;
   private cwd: string;
+  /** Set of all built-in + custom command names (for shadowing protection). */
+  private builtinCommandNames: Set<string>;
 
   constructor(private options: WasmShellOptions) {
     this.vfsAdapter = new VfsAdapter(options.fs);
@@ -185,23 +224,38 @@ export class WasmShell {
     const gitCommand = this.createGitCustomCommand();
     const supplementalCommands = createSupplementalCommands({
       onMediaPreview: async (items) => this.renderMediaPreview(items),
+      getJshCommands: () => this.getJshCommandNames(),
+      fs: options.fs,
+      browserAPI: options.browserAPI,
     });
     const mountCommand = this.createMountCustomCommand();
     const fetchFn = createProxiedFetch();
+
+    const customCommands = [
+      gitCommand,
+      mountCommand,
+      createSkillCommand(options.fs),
+      createUpskillCommand(options.fs, fetchFn),
+      ...supplementalCommands,
+    ];
 
     this.bash = new Bash({
       fs: this.vfsAdapter,
       cwd: initialCwd,
       env: initialEnv,
       fetch: fetchFn,
-      customCommands: [
-        gitCommand,
-        mountCommand,
-        createSkillCommand(options.fs),
-        createUpskillCommand(options.fs, fetchFn),
-        ...supplementalCommands,
-      ],
+      customCommands,
     });
+
+    // Wire up /usr/bin virtual directory with all registered command names
+    const customCommandNames = customCommands.map((c) => c.name);
+    this.builtinCommandNames = new Set([
+      ...getCommandNames(),
+      ...getNetworkCommandNames(),
+      ...customCommandNames,
+    ]);
+    this.vfsAdapter.setRegisteredCommandsFn(() => [...this.builtinCommandNames]);
+
     this.lastEnv = { ...initialEnv };
     this.cwd = initialCwd;
   }
@@ -249,8 +303,63 @@ export class WasmShell {
     return { ...this.lastEnv };
   }
 
+  /** Discover .jsh commands from VFS (fresh scan each call, no caching), filtering out built-in command names. */
+  private async getFilteredJshCommands(): Promise<Map<string, string>> {
+    const all = await discoverJshCommands(this.options.fs);
+    const filtered = new Map<string, string>();
+    for (const [name, path] of all) {
+      if (!this.builtinCommandNames.has(name)) {
+        filtered.set(name, path);
+      }
+    }
+    return filtered;
+  }
+
+  /** Get currently discovered .jsh command names. */
+  async getJshCommandNames(): Promise<string[]> {
+    const jshMap = await this.getFilteredJshCommands();
+    return [...jshMap.keys()];
+  }
+
+  /**
+   * Try to run a command as a .jsh script if bash returned 127 (command not found).
+   * Returns null if the command is not a .jsh file.
+   */
+  private async tryJshFallback(command: string): Promise<BashExecResult | null> {
+    // Parse the first word as the command name
+    const trimmed = command.trim();
+    const firstSpace = trimmed.indexOf(' ');
+    const cmdName = firstSpace >= 0 ? trimmed.slice(0, firstSpace) : trimmed;
+    const argsStr = firstSpace >= 0 ? trimmed.slice(firstSpace + 1).trim() : '';
+
+    const jshMap = await this.getFilteredJshCommands();
+    const scriptPath = jshMap.get(cmdName);
+    if (!scriptPath) return null;
+
+    const args = argsStr ? parseShellArgs(argsStr) : [];
+
+    const result = await executeJshFile(scriptPath, args, {
+      fs: this.vfsAdapter,
+      cwd: this.cwd,
+      env: new Map(Object.entries(this.lastEnv)),
+      stdin: '',
+      exec: (cmd, opts) => this.bash.exec(cmd, { env: this.lastEnv, cwd: opts?.cwd ?? this.cwd }),
+    });
+
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      env: this.lastEnv,
+    };
+  }
+
   /** Run a command through just-bash, carrying forward env/cwd state. */
   private async runCommand(command: string): Promise<BashExecResult> {
+    // Track shell command for telemetry (extract first word as command name)
+    const commandName = command.trim().split(/\s+/)[0] || 'unknown';
+    trackShellCommand(commandName);
+
     const result = await this.bash.exec(command, {
       env: this.lastEnv,
       cwd: this.cwd,
@@ -262,6 +371,13 @@ export class WasmShell {
     if (result.env?.PWD) {
       this.cwd = result.env.PWD;
     }
+
+    // If bash returned 127 (command not found), try .jsh fallback
+    if (result.exitCode === 127) {
+      const jshResult = await this.tryJshFallback(command);
+      if (jshResult) return jshResult;
+    }
+
     return result;
   }
 
@@ -275,17 +391,74 @@ export class WasmShell {
     const { FitAddon } = await import('@xterm/addon-fit');
     await import('@xterm/xterm/css/xterm.css');
 
+    const isDark = !document.documentElement.classList.contains('theme-light');
+    const darkTheme = {
+      background: '#141414',
+      foreground: '#cfcfcf',
+      cursor: '#3562ff',
+      cursorAccent: '#141414',
+      selectionBackground: '#3562ff40',
+      selectionForeground: '#ffffff',
+      black: '#1a1a1a',
+      red: '#e34850',
+      green: '#2d9d78',
+      yellow: '#e68619',
+      blue: '#3562ff',
+      magenta: '#a962e8',
+      cyan: '#2db9be',
+      white: '#cfcfcf',
+      brightBlack: '#5a5a5a',
+      brightRed: '#e34850',
+      brightGreen: '#2d9d78',
+      brightYellow: '#e68619',
+      brightBlue: '#4a75ff',
+      brightMagenta: '#a962e8',
+      brightCyan: '#2db9be',
+      brightWhite: '#ffffff',
+    };
+    const lightTheme = {
+      background: '#f0f0f0',
+      foreground: '#1a1a1a',
+      cursor: '#2b54db',
+      cursorAccent: '#f0f0f0',
+      selectionBackground: '#2b54db30',
+      selectionForeground: '#000000',
+      black: '#1a1a1a',
+      red: '#d73220',
+      green: '#268e6c',
+      yellow: '#d17a00',
+      blue: '#2b54db',
+      magenta: '#8839ef',
+      cyan: '#1a9088',
+      white: '#e8e8e8',
+      brightBlack: '#6e6e6e',
+      brightRed: '#d73220',
+      brightGreen: '#268e6c',
+      brightYellow: '#d17a00',
+      brightBlue: '#1e44c4',
+      brightMagenta: '#8839ef',
+      brightCyan: '#1a9088',
+      brightWhite: '#ffffff',
+    };
+
     this.terminal = new Terminal({
       cursorBlink: true,
-      fontSize: 14,
-      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
-      theme: {
-        background: '#1a1a2e',
-        foreground: '#e0e0e0',
-        cursor: '#e94560',
-        selectionBackground: '#e9456040',
-      },
+      fontSize: 11,
+      fontFamily: "'Source Code Pro', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+      theme: isDark ? darkTheme : lightTheme,
       convertEol: true,
+    });
+
+    // Sync xterm theme when .theme-light class changes on <html>
+    this.themeObserver?.disconnect();
+    this.themeObserver = new MutationObserver(() => {
+      if (!this.terminal) return;
+      const isLight = document.documentElement.classList.contains('theme-light');
+      this.terminal.options.theme = isLight ? lightTheme : darkTheme;
+    });
+    this.themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
     });
 
     this.fitAddon = new FitAddon();
@@ -309,21 +482,40 @@ export class WasmShell {
     this.resizeObserver.observe(this.terminalHost);
 
     // Write welcome message
-    this.terminal.writeln('slicc shell (powered by just-bash)');
-    this.terminal.writeln('Type "help" for available commands.\n');
+    this.terminal.writeln('\x1b[1mslicc\x1b[0m \x1b[90mshell (powered by just-bash)\x1b[0m');
+    this.terminal.writeln('\x1b[90mType "help" for available commands.\x1b[0m\n');
 
     this.showPrompt();
     this.setupInputHandler();
   }
 
   /** Execute a command programmatically (useful for agent integration). */
-  async executeCommand(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  async executeCommand(
+    command: string
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const result = await this.runCommand(command);
     return {
       stdout: result.stdout,
       stderr: result.stderr,
       exitCode: result.exitCode,
     };
+  }
+
+  /**
+   * Execute a .jsh/.bsh script file by VFS path.
+   * Uses the same execution engine as JSH commands (JavaScript, not bash).
+   */
+  async executeScriptFile(
+    scriptPath: string,
+    args: string[] = []
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    return executeJshFile(scriptPath, args, {
+      fs: this.vfsAdapter,
+      cwd: this.cwd,
+      env: new Map(Object.entries(this.lastEnv)),
+      stdin: '',
+      exec: (cmd, opts) => this.bash.exec(cmd, { env: this.lastEnv, cwd: opts?.cwd ?? this.cwd }),
+    });
   }
 
   /** Re-fit the terminal to its host container. */
@@ -340,7 +532,9 @@ export class WasmShell {
    * Execute a command and render it in the mounted terminal.
    * Returns the command result for callers that need status.
    */
-  async executeCommandInTerminal(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  async executeCommandInTerminal(
+    command: string
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const trimmed = command.trim();
     if (!trimmed) {
       return { stdout: '', stderr: '', exitCode: 0 };
@@ -403,6 +597,8 @@ export class WasmShell {
 
   /** Dispose the terminal. */
   dispose(): void {
+    this.themeObserver?.disconnect();
+    this.themeObserver = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.clearMediaPreview();
@@ -415,8 +611,8 @@ export class WasmShell {
 
   private showPrompt(): void {
     if (!this.terminal) return;
-    const shortCwd = this.cwd === '/' ? '/' : this.cwd.split('/').pop() ?? this.cwd;
-    this.terminal.write(`\x1b[36m${shortCwd}\x1b[0m \x1b[33m$\x1b[0m `);
+    const shortCwd = this.cwd === '/' ? '/' : (this.cwd.split('/').pop() ?? this.cwd);
+    this.terminal.write(`\x1b[34m${shortCwd}\x1b[0m \x1b[90m$\x1b[0m `);
   }
 
   private setupInputHandler(): void {
@@ -428,13 +624,31 @@ export class WasmShell {
       // Handle escape sequences as a whole (arrow keys, Home, End, Delete)
       if (data.startsWith('\x1b[') || data.startsWith('\x1bO')) {
         switch (data) {
-          case '\x1b[A': this.handleHistoryUp(); return;
-          case '\x1b[B': this.handleHistoryDown(); return;
-          case '\x1b[C': this.handleArrowRight(); return;
-          case '\x1b[D': this.handleArrowLeft(); return;
-          case '\x1b[H': case '\x1bOH': case '\x1b[1~': this.handleHome(); return;
-          case '\x1b[F': case '\x1bOF': case '\x1b[4~': this.handleEnd(); return;
-          case '\x1b[3~': this.handleDelete(); return;
+          case '\x1b[A':
+            this.handleHistoryUp();
+            return;
+          case '\x1b[B':
+            this.handleHistoryDown();
+            return;
+          case '\x1b[C':
+            this.handleArrowRight();
+            return;
+          case '\x1b[D':
+            this.handleArrowLeft();
+            return;
+          case '\x1b[H':
+          case '\x1bOH':
+          case '\x1b[1~':
+            this.handleHome();
+            return;
+          case '\x1b[F':
+          case '\x1bOF':
+          case '\x1b[4~':
+            this.handleEnd();
+            return;
+          case '\x1b[3~':
+            this.handleDelete();
+            return;
         }
         return; // Ignore unknown escape sequences
       }
@@ -442,10 +656,18 @@ export class WasmShell {
       // Handle regular characters one at a time (supports paste)
       for (const ch of data) {
         switch (ch) {
-          case '\r': this.handleEnter(); break;
-          case '\x7f': this.handleBackspace(); break;
-          case '\x03': this.handleCtrlC(); break;
-          case '\t': this.handleTab(); break;
+          case '\r':
+            this.handleEnter();
+            break;
+          case '\x7f':
+            this.handleBackspace();
+            break;
+          case '\x03':
+            this.handleCtrlC();
+            break;
+          case '\t':
+            this.handleTab();
+            break;
           default:
             if (ch >= ' ') this.insertChar(ch);
         }
@@ -457,7 +679,7 @@ export class WasmShell {
 
   /** Visual width of the prompt: "cwd $ " */
   private getPromptWidth(): number {
-    const shortCwd = this.cwd === '/' ? '/' : this.cwd.split('/').pop() ?? this.cwd;
+    const shortCwd = this.cwd === '/' ? '/' : (this.cwd.split('/').pop() ?? this.cwd);
     return shortCwd.length + 3;
   }
 
@@ -474,10 +696,14 @@ export class WasmShell {
   /** Move terminal cursor from end-of-content to the position matching cursorPos. */
   private positionTerminalCursor(): void {
     const lines = this.currentLine.split('\n');
-    let targetLine = 0, targetCol = 0, pos = 0;
+    let targetLine = 0,
+      targetCol = 0,
+      pos = 0;
     for (let i = 0; i < lines.length; i++) {
       if (pos + lines[i].length >= this.cursorPos) {
-        targetLine = i; targetCol = this.cursorPos - pos; break;
+        targetLine = i;
+        targetCol = this.cursorPos - pos;
+        break;
       }
       pos += lines[i].length + 1;
     }
@@ -503,8 +729,7 @@ export class WasmShell {
     const multiLine = this.currentLine.includes('\n');
     const oldLine = multiLine ? this.getCursorVisualLine() : 0;
     const after = this.currentLine.slice(this.cursorPos);
-    this.currentLine =
-      this.currentLine.slice(0, this.cursorPos) + ch + after;
+    this.currentLine = this.currentLine.slice(0, this.cursorPos) + ch + after;
     this.cursorPos++;
     if (multiLine) {
       this.redrawInput(oldLine);
@@ -519,8 +744,7 @@ export class WasmShell {
     const multiLine = this.currentLine.includes('\n');
     const oldLine = multiLine ? this.getCursorVisualLine() : 0;
     const after = this.currentLine.slice(this.cursorPos);
-    this.currentLine =
-      this.currentLine.slice(0, this.cursorPos - 1) + after;
+    this.currentLine = this.currentLine.slice(0, this.cursorPos - 1) + after;
     this.cursorPos--;
     if (multiLine) {
       this.redrawInput(oldLine);
@@ -535,8 +759,7 @@ export class WasmShell {
     const multiLine = this.currentLine.includes('\n');
     const oldLine = multiLine ? this.getCursorVisualLine() : 0;
     const after = this.currentLine.slice(this.cursorPos + 1);
-    this.currentLine =
-      this.currentLine.slice(0, this.cursorPos) + after;
+    this.currentLine = this.currentLine.slice(0, this.cursorPos) + after;
     if (multiLine) {
       this.redrawInput(oldLine);
     } else {
@@ -555,9 +778,7 @@ export class WasmShell {
       const before = this.currentLine.slice(0, this.cursorPos);
       const prevLineStart = before.lastIndexOf('\n') + 1;
       const prevLineLen = this.cursorPos - prevLineStart;
-      const visualCol = prevLineStart === 0
-        ? this.getPromptWidth() + prevLineLen
-        : prevLineLen;
+      const visualCol = prevLineStart === 0 ? this.getPromptWidth() + prevLineLen : prevLineLen;
       this.terminal?.write('\x1b[A\r');
       if (visualCol > 0) this.terminal?.write(`\x1b[${visualCol}C`);
     } else {
@@ -650,17 +871,26 @@ export class WasmShell {
         const completion = matches[0];
         const suffix = completion.slice(currentWord.length);
         if (suffix) {
-          this.currentLine = this.currentLine.slice(0, this.cursorPos) + suffix + this.currentLine.slice(this.cursorPos);
+          this.currentLine =
+            this.currentLine.slice(0, this.cursorPos) +
+            suffix +
+            this.currentLine.slice(this.cursorPos);
           this.cursorPos += suffix.length;
           this.terminal.write(suffix);
         }
         // Add trailing slash for dirs, space for everything else
         let trail = ' ';
         if (!isFirstWord) {
-          const dirCheck = await this.bash.exec(`compgen -d -- ${escaped.slice(0, -1)}${suffix}'`, { env: this.lastEnv, cwd: this.cwd });
+          const dirCheck = await this.bash.exec(`compgen -d -- ${escaped.slice(0, -1)}${suffix}'`, {
+            env: this.lastEnv,
+            cwd: this.cwd,
+          });
           if (dirCheck.stdout.trim() === completion) trail = '/';
         }
-        this.currentLine = this.currentLine.slice(0, this.cursorPos) + trail + this.currentLine.slice(this.cursorPos);
+        this.currentLine =
+          this.currentLine.slice(0, this.cursorPos) +
+          trail +
+          this.currentLine.slice(this.cursorPos);
         this.cursorPos += 1;
         this.terminal.write(trail);
       } else {
@@ -671,7 +901,10 @@ export class WasmShell {
         }
         const suffix = prefix.slice(currentWord.length);
         if (suffix) {
-          this.currentLine = this.currentLine.slice(0, this.cursorPos) + suffix + this.currentLine.slice(this.cursorPos);
+          this.currentLine =
+            this.currentLine.slice(0, this.cursorPos) +
+            suffix +
+            this.currentLine.slice(this.cursorPos);
           this.cursorPos += suffix.length;
           this.terminal.write(suffix);
         } else {
@@ -685,7 +918,10 @@ export class WasmShell {
         }
       }
     } catch (err) {
-      console.warn('[Shell] Tab completion failed:', err instanceof Error ? err.message : String(err));
+      console.warn(
+        '[Shell] Tab completion failed:',
+        err instanceof Error ? err.message : String(err)
+      );
     }
   }
 
@@ -706,10 +942,22 @@ export class WasmShell {
     let inDouble = false;
     let escaped = false;
     for (const ch of input) {
-      if (escaped) { escaped = false; continue; }
-      if (ch === '\\' && !inSingle) { escaped = true; continue; }
-      if (ch === "'" && !inDouble) { inSingle = !inSingle; continue; }
-      if (ch === '"' && !inSingle) { inDouble = !inDouble; continue; }
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\' && !inSingle) {
+        escaped = true;
+        continue;
+      }
+      if (ch === "'" && !inDouble) {
+        inSingle = !inSingle;
+        continue;
+      }
+      if (ch === '"' && !inSingle) {
+        inDouble = !inDouble;
+        continue;
+      }
     }
     return inSingle || inDouble;
   }
@@ -731,9 +979,7 @@ export class WasmShell {
     this.cursorPos = 0;
 
     // Accumulate continuation lines
-    const combined = this.continuationBuffer
-      ? this.continuationBuffer + '\n' + line
-      : line;
+    const combined = this.continuationBuffer ? this.continuationBuffer + '\n' + line : line;
 
     if (this.isIncomplete(combined)) {
       this.continuationBuffer = combined;

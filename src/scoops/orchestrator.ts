@@ -9,12 +9,7 @@
  * - Owns a single shared VirtualFS instance
  */
 
-import type {
-  RegisteredScoop,
-  ChannelMessage,
-  ScoopTabState,
-  ScheduledTask,
-} from './types.js';
+import type { RegisteredScoop, ChannelMessage, ScoopTabState, ScheduledTask } from './types.js';
 import * as db from './db.js';
 import { createLogger } from '../core/logger.js';
 import { ScoopContext, type ScoopContextCallbacks } from './scoop-context.js';
@@ -22,8 +17,10 @@ import { TaskScheduler } from './scheduler.js';
 import { VirtualFS } from '../fs/index.js';
 import { RestrictedFS } from '../fs/restricted-fs.js';
 import type { BrowserAPI } from '../cdp/index.js';
-import { createDefaultSharedFiles } from './skills.js';
+import { createDefaultSharedFiles, createDefaultSkills } from './skills.js';
 import { buildActiveLicksError, type LickManager } from './lick-manager.js';
+import { SessionStore } from '../core/session.js';
+import { trackChatSend } from '../ui/telemetry.js';
 
 const log = createLogger('orchestrator');
 
@@ -38,12 +35,16 @@ export interface OrchestratorCallbacks {
   onStatusChange: (scoopJid: string, status: ScoopTabState['status']) => void;
   /** Called on error */
   onError: (scoopJid: string, error: string) => void;
-  /** Get the browser API for browser tool */
+  /** Get the BrowserAPI used by browser automation commands */
   getBrowserAPI: () => BrowserAPI;
   /** Called when a tool starts executing */
   onToolStart?: (scoopJid: string, toolName: string, toolInput: unknown) => void;
   /** Called when a tool finishes executing */
   onToolEnd?: (scoopJid: string, toolName: string, result: string, isError: boolean) => void;
+  /** Called when a tool requests UI interaction */
+  onToolUI?: (scoopJid: string, toolName: string, requestId: string, html: string) => void;
+  /** Called when tool UI interaction is complete */
+  onToolUIDone?: (scoopJid: string, requestId: string) => void;
   /** Called when a message is routed to a scoop (delegation, lick, etc.) */
   onIncomingMessage?: (scoopJid: string, message: ChannelMessage) => void;
 }
@@ -69,11 +70,12 @@ export class Orchestrator {
   /** Accumulates response text per scoop for routing back to cone on completion. */
   private scoopResponseBuffer: Map<string, string> = new Map();
   private lickManager: LickManager | null = null;
+  private sessionStore: SessionStore | null = null;
 
   constructor(
     container: HTMLElement,
     callbacks: OrchestratorCallbacks,
-    config: AssistantConfig = { name: 'sliccy', triggerPattern: /^@sliccy\b/i },
+    config: AssistantConfig = { name: 'sliccy', triggerPattern: /^@sliccy\b/i }
   ) {
     this.container = container;
     this.callbacks = callbacks;
@@ -86,6 +88,7 @@ export class Orchestrator {
 
     // Create the single shared VirtualFS
     this.sharedFs = await VirtualFS.create({ dbName: 'slicc-fs' });
+    this.sessionStore = new SessionStore();
     await this.ensureRootStructure();
 
     const savedScoops = await db.getAllScoops();
@@ -112,7 +115,12 @@ export class Orchestrator {
     this.scheduler = new TaskScheduler({
       onTaskRun: async (task, scoop) => {
         log.info('Running scheduled task', { taskId: task.id, scoop: scoop.name });
-        await this.sendPrompt(scoop.jid, `[SCHEDULED TASK]\n\n${task.prompt}`, 'scheduler', 'Scheduled Task');
+        await this.sendPrompt(
+          scoop.jid,
+          `[SCHEDULED TASK]\n\n${task.prompt}`,
+          'scheduler',
+          'Scheduled Task'
+        );
       },
       getScoop: (folder) => {
         for (const s of this.scoops.values()) {
@@ -156,7 +164,8 @@ export class Orchestrator {
 
     try {
       const content = await this.sharedFs.readFile('/shared/CLAUDE.md', { encoding: 'utf-8' });
-      this.globalMemoryCache = typeof content === 'string' ? content : new TextDecoder().decode(content);
+      this.globalMemoryCache =
+        typeof content === 'string' ? content : new TextDecoder().decode(content);
     } catch {
       // No global memory file - this shouldn't happen after createDefaultSharedFiles
       log.warn('Global memory file not found after creating defaults');
@@ -170,7 +179,8 @@ export class Orchestrator {
     if (this.sharedFs) {
       try {
         const content = await this.sharedFs.readFile('/shared/CLAUDE.md', { encoding: 'utf-8' });
-        this.globalMemoryCache = typeof content === 'string' ? content : new TextDecoder().decode(content);
+        this.globalMemoryCache =
+          typeof content === 'string' ? content : new TextDecoder().decode(content);
       } catch {
         // No global memory yet
       }
@@ -197,15 +207,20 @@ export class Orchestrator {
     this.lickManager = lickManager;
   }
 
-  /** Register a new scoop */
+  /** Register a new scoop. Initialization is non-blocking — the scoop
+   *  starts as 'initializing' and becomes 'ready' in the background.
+   *  `sendPrompt` already handles this by waiting for 'ready' status. */
   async registerScoop(scoop: RegisteredScoop): Promise<void> {
     await db.saveScoop(scoop);
     this.scoops.set(scoop.jid, scoop);
     this.messageQueues.set(scoop.jid, []);
     log.info('Scoop registered', { jid: scoop.jid, name: scoop.name });
 
-    // Auto-initialize the scoop context
-    await this.createScoopTab(scoop.jid);
+    // Fire-and-forget: init runs in background. sendPrompt waits if needed.
+    this.createScoopTab(scoop.jid).catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error('Scoop init failed', { jid: scoop.jid, error: msg });
+    });
   }
 
   /** Unregister a scoop. Throws if the scoop has active licks (webhooks/cron tasks). */
@@ -219,6 +234,12 @@ export class Orchestrator {
     }
 
     await this.destroyScoopTab(jid);
+    this.sessionStore?.delete(jid).catch((err) => {
+      log.warn('Failed to delete agent session', {
+        jid,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
     await db.deleteScoop(jid);
     this.scoops.delete(jid);
     this.messageQueues.delete(jid);
@@ -236,9 +257,39 @@ export class Orchestrator {
     return this.scoops.get(jid);
   }
 
-  /** Clear all messages from the orchestrator DB and reset timestamps. */
+  /** Wipe the virtual filesystem and re-seed default files (skills, shared CLAUDE.md). */
+  async resetFilesystem(): Promise<void> {
+    // Destroy all scoop contexts (they hold references to the old VFS)
+    for (const [jid, ctx] of this.contexts.entries()) {
+      ctx.stop();
+      this.contexts.delete(jid);
+    }
+    // Re-create the VFS with wipe: true
+    this.sharedFs = await VirtualFS.create({ dbName: 'slicc-fs', wipe: true });
+    await this.ensureRootStructure();
+    await this.ensureGlobalMemory();
+    await createDefaultSkills(this.sharedFs).catch((err) => {
+      log.warn('Failed to re-seed default skills', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+    log.info('Filesystem reset and defaults re-seeded');
+  }
+
+  /** Clear all messages from the orchestrator DB, agent sessions, and live agent contexts. */
   async clearAllMessages(): Promise<void> {
     await db.clearAllMessages();
+    if (this.sessionStore) {
+      await this.sessionStore.clearAll().catch((err) => {
+        log.warn('Failed to clear agent sessions', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+    // Clear in-memory conversation history from all live scoop agents
+    for (const ctx of this.contexts.values()) {
+      ctx.clearMessages();
+    }
     this.lastAgentTimestamp.clear();
     for (const jid of this.scoops.keys()) {
       this.messageQueues.set(jid, []);
@@ -255,6 +306,11 @@ export class Orchestrator {
       channel: message.channel,
       contentPreview: message.content.slice(0, 80),
     });
+
+    // Telemetry: track chat sends
+    const scoop = this.scoops.get(message.chatJid);
+    const scoopName = scoop?.isCone ? 'cone' : (scoop?.name ?? 'unknown');
+    trackChatSend(scoopName, localStorage.getItem('selected-model') ?? 'unknown');
 
     // Store the message
     await db.saveMessage(message);
@@ -286,7 +342,12 @@ export class Orchestrator {
     // Notify UI about the incoming delegation
     this.callbacks.onIncomingMessage?.(scoopJid, msg);
 
-    log.info('Delegating to scoop', { scoopJid, scoopName: scoop.name, promptLength: prompt.length });
+    log.info('Delegating to scoop', {
+      scoopJid,
+      scoopName: scoop.name,
+      promptLength: prompt.length,
+    });
+
     // Fire-and-forget: don't await the scoop's agent loop.
     // The cone's tool call returns immediately so the cone can finish its turn.
     // The scoop processes in the background; completion notification routes back to cone.
@@ -324,14 +385,23 @@ export class Orchestrator {
     queue.push(message);
     this.messageQueues.set(message.chatJid, queue);
 
-    // Process immediately if tab is ready
-    const tab = this.tabs.get(message.chatJid);
-    log.info('routeToScoop: queued', {
+    // Process immediately if tab is ready; retry init if in error state
+    let tab = this.tabs.get(message.chatJid);
+    log.debug('routeToScoop: queued', {
       chatJid: message.chatJid,
       scoopName: scoop.name,
       tabStatus: tab?.status ?? 'no-tab',
       queueLength: queue.length,
     });
+    if (tab?.status === 'error') {
+      log.info('routeToScoop: tab in error state, retrying init', { chatJid: message.chatJid });
+      try {
+        await this.createScoopTab(message.chatJid);
+        tab = this.tabs.get(message.chatJid);
+      } catch {
+        log.warn('routeToScoop: retry init failed', { chatJid: message.chatJid });
+      }
+    }
     if (tab?.status === 'ready') {
       await this.processScoopQueue(message.chatJid);
     }
@@ -418,11 +488,12 @@ export class Orchestrator {
           const responseText = this.scoopResponseBuffer.get(jid);
           this.scoopResponseBuffer.delete(jid);
           if (responseText) {
-            const cone = Array.from(this.scoops.values()).find(s => s.isCone);
+            const cone = Array.from(this.scoops.values()).find((s) => s.isCone);
             if (cone) {
-              const summary = responseText.length > 2000
-                ? responseText.slice(0, 2000) + '\n... (truncated)'
-                : responseText;
+              const summary =
+                responseText.length > 2000
+                  ? responseText.slice(0, 2000) + '\n... (truncated)'
+                  : responseText;
               const notifyMsg: ChannelMessage = {
                 id: `scoop-done-${jid}-${Date.now()}`,
                 chatJid: cone.jid,
@@ -433,11 +504,20 @@ export class Orchestrator {
                 fromAssistant: false,
                 channel: 'scoop-notify',
               };
-              log.info('Routing scoop completion to cone', { scoop: scoop.folder, responseLength: responseText.length });
+              log.info('Routing scoop completion to cone', {
+                scoop: scoop.folder,
+                responseLength: responseText.length,
+              });
               this.handleMessage(notifyMsg).catch((err) => {
                 const msg = err instanceof Error ? err.message : String(err);
-                log.error('Failed to route scoop completion to cone', { scoop: scoop.folder, error: msg });
-                this.callbacks.onError(cone.jid, `Scoop ${scoop.folder} completed but notification failed: ${msg}`);
+                log.error('Failed to route scoop completion to cone', {
+                  scoop: scoop.folder,
+                  error: msg,
+                });
+                this.callbacks.onError(
+                  cone.jid,
+                  `Scoop ${scoop.folder} completed but notification failed: ${msg}`
+                );
               });
             }
           }
@@ -449,29 +529,41 @@ export class Orchestrator {
       onToolEnd: (toolName, result, isError) => {
         this.callbacks.onToolEnd?.(jid, toolName, result, isError);
       },
+      onToolUI: (toolName, requestId, html) => {
+        this.callbacks.onToolUI?.(jid, toolName, requestId, html);
+      },
+      onToolUIDone: (requestId) => {
+        this.callbacks.onToolUIDone?.(jid, requestId);
+      },
       // NanoClaw tools callbacks
       onSendMessage: (text, sender) => {
         this.callbacks.onSendMessage(jid, `${sender ? `[${sender}] ` : ''}${text}`);
       },
       getScoops: () => this.getScoops(),
-      onFeedScoop: scoop.isCone ? (scoopJid, prompt) => this.delegateToScoop(scoopJid, prompt, scoop.assistantLabel) : undefined,
-      onScoopScoop: scoop.isCone ? async (newScoop) => {
-        const fullScoop: RegisteredScoop = {
-          ...newScoop,
-          jid: `scoop_${newScoop.folder}_${Date.now()}`,
-        };
-        await this.registerScoop(fullScoop);
-        return fullScoop;
-      } : undefined,
-      onDropScoop: scoop.isCone ? async (scoopJid) => {
-        await this.unregisterScoop(scoopJid);
-      } : undefined,
+      onFeedScoop: scoop.isCone
+        ? (scoopJid, prompt) => this.delegateToScoop(scoopJid, prompt, scoop.assistantLabel)
+        : undefined,
+      onScoopScoop: scoop.isCone
+        ? async (newScoop) => {
+            const fullScoop: RegisteredScoop = {
+              ...newScoop,
+              jid: `scoop_${newScoop.folder}_${Date.now()}`,
+            };
+            await this.registerScoop(fullScoop);
+            return fullScoop;
+          }
+        : undefined,
+      onDropScoop: scoop.isCone
+        ? async (scoopJid) => {
+            await this.unregisterScoop(scoopJid);
+          }
+        : undefined,
       getGlobalMemory: () => this.getGlobalMemory(),
       setGlobalMemory: scoop.isCone ? (content) => this.setGlobalMemory(content) : undefined,
       getBrowserAPI: () => this.callbacks.getBrowserAPI(),
     };
 
-    const context = new ScoopContext(scoop, contextCallbacks, fs);
+    const context = new ScoopContext(scoop, contextCallbacks, fs, this.sessionStore ?? undefined);
 
     this.contexts.set(jid, context);
     this.tabs.set(jid, {
@@ -483,6 +575,14 @@ export class Orchestrator {
 
     // Initialize the context
     await context.init();
+
+    // Mark tab as ready so queued messages (lick events, etc.) get processed
+    const initTab = this.tabs.get(jid);
+    if (initTab && initTab.status === 'initializing') {
+      initTab.status = 'ready';
+      this.tabs.set(jid, initTab);
+      this.callbacks.onStatusChange(jid, 'ready');
+    }
 
     log.info('Scoop context created', { jid, contextId });
   }
@@ -527,7 +627,7 @@ export class Orchestrator {
     // Remove from in-memory queue
     const queue = this.messageQueues.get(jid);
     if (queue) {
-      const idx = queue.findIndex(m => m.id === messageId);
+      const idx = queue.findIndex((m) => m.id === messageId);
       if (idx !== -1) queue.splice(idx, 1);
     }
     // Remove from IndexedDB
@@ -603,13 +703,13 @@ export class Orchestrator {
   private async processScoopQueue(jid: string): Promise<void> {
     const queue = this.messageQueues.get(jid);
     if (!queue || queue.length === 0) {
-      log.info('processScoopQueue: empty queue', { jid });
+      log.debug('processScoopQueue: empty queue', { jid });
       return;
     }
 
     const tab = this.tabs.get(jid);
     if (tab?.status !== 'ready') {
-      log.info('processScoopQueue: tab not ready', { jid, status: tab?.status ?? 'no-tab' });
+      log.debug('processScoopQueue: tab not ready', { jid, status: tab?.status ?? 'no-tab' });
       return;
     }
 
@@ -621,7 +721,7 @@ export class Orchestrator {
     const since = this.lastAgentTimestamp.get(jid) ?? '';
     const messages = await db.getMessagesSince(jid, since, excludeName);
 
-    log.info('processScoopQueue: DB query', {
+    log.debug('processScoopQueue: DB query', {
       jid,
       scoopName: scoop?.name,
       excludeName,
@@ -631,23 +731,25 @@ export class Orchestrator {
     });
 
     if (messages.length === 0) {
-      log.info('processScoopQueue: no messages from DB, clearing queue', { jid });
+      log.debug('processScoopQueue: no messages from DB, clearing queue', { jid });
       this.messageQueues.set(jid, []);
       return;
     }
 
     // Format messages
-    const formatted = messages.map((m) => {
-      const date = new Date(m.timestamp);
-      const time = date.toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-      });
-      return `[${time}] ${m.senderName}: ${m.content}`;
-    }).join('\n');
+    const formatted = messages
+      .map((m) => {
+        const date = new Date(m.timestamp);
+        const time = date.toLocaleString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true,
+        });
+        return `[${time}] ${m.senderName}: ${m.content}`;
+      })
+      .join('\n');
 
     // Clear queue and update high-water mark
     this.messageQueues.set(jid, []);

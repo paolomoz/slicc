@@ -87,18 +87,14 @@ function parseYaml(content: string): Record<string, unknown> {
 }
 
 /**
- * Read and parse a skill manifest from the virtual filesystem.
+ * Parse manifest YAML content and validate required fields.
  */
-export async function readManifest(
-  fs: VirtualFS,
-  skillDir: string,
-): Promise<SkillManifest> {
-  const manifestPath = `${skillDir}/${MANIFEST_FILE}`;
-  
-  const content = await fs.readTextFile(manifestPath);
+export function parseManifestContent(
+  content: string,
+  manifestPath: string = MANIFEST_FILE
+): SkillManifest {
   const parsed = parseYaml(content);
 
-  // Validate required fields
   if (!parsed.skill || typeof parsed.skill !== 'string') {
     throw new Error(`Invalid manifest: missing 'skill' field in ${manifestPath}`);
   }
@@ -121,15 +117,22 @@ export async function readManifest(
 }
 
 /**
+ * Read and parse a skill manifest from the virtual filesystem.
+ */
+export async function readManifest(fs: VirtualFS, skillDir: string): Promise<SkillManifest> {
+  const manifestPath = `${skillDir}/${MANIFEST_FILE}`;
+  const content = await fs.readTextFile(manifestPath);
+  return parseManifestContent(content, manifestPath);
+}
+
+/**
  * Check if a skill's dependencies are satisfied.
  */
 export function checkDependencies(
   manifest: SkillManifest,
-  appliedSkills: string[],
+  appliedSkills: string[]
 ): { ok: boolean; missing: string[] } {
-  const missing = (manifest.depends || []).filter(
-    (dep) => !appliedSkills.includes(dep),
-  );
+  const missing = (manifest.depends || []).filter((dep) => !appliedSkills.includes(dep));
   return { ok: missing.length === 0, missing };
 }
 
@@ -138,10 +141,8 @@ export function checkDependencies(
  */
 export function checkConflicts(
   manifest: SkillManifest,
-  appliedSkills: string[],
+  appliedSkills: string[]
 ): { ok: boolean; conflicting: string[] } {
-  const conflicting = (manifest.conflicts || []).filter((c) =>
-    appliedSkills.includes(c),
-  );
+  const conflicting = (manifest.conflicts || []).filter((c) => appliedSkills.includes(c));
   return { ok: conflicting.length === 0, conflicting };
 }

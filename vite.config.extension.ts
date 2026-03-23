@@ -4,13 +4,14 @@
  * Produces dist/extension/ with:
  * - index.html (side panel UI — bundled from src/ui/main.ts)
  * - service-worker.js (built from src/extension/service-worker.ts)
+ * - offscreen.html + offscreen entry (built from src/extension/offscreen.ts)
  * - sandbox.html, manifest.json (copied from project root)
  */
 
 import { defineConfig } from 'vite';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { copyFileSync, mkdirSync } from 'fs';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -27,6 +28,15 @@ export default defineConfig(({ mode }) => ({
       'http': resolve(__dirname, 'src/shims/http.ts'),
       'https': resolve(__dirname, 'src/shims/https.ts'),
       'http2': resolve(__dirname, 'src/shims/http2.ts'),
+      // Deep import into pi-coding-agent's compaction submodule (see vite.config.ts)
+      '@mariozechner/pi-coding-agent/dist/core/compaction/compaction.js': resolve(
+        __dirname,
+        'node_modules/@mariozechner/pi-coding-agent/dist/core/compaction/compaction.js',
+      ),
+      '@mariozechner/pi-ai/dist/utils/overflow.js': resolve(
+        __dirname,
+        'node_modules/@mariozechner/pi-ai/dist/utils/overflow.js',
+      ),
     },
   },
   esbuild: {
@@ -44,6 +54,7 @@ export default defineConfig(({ mode }) => ({
     rollupOptions: {
       input: {
         index: resolve(__dirname, 'index.html'),
+        offscreen: resolve(__dirname, 'offscreen.html'),
         'service-worker': resolve(__dirname, 'src/extension/service-worker.ts'),
       },
       output: {
@@ -77,10 +88,43 @@ export default defineConfig(({ mode }) => ({
       closeBundle() {
         const outDir = resolve(__dirname, 'dist/extension');
         mkdirSync(outDir, { recursive: true });
-        copyFileSync(resolve(__dirname, 'manifest.json'), resolve(outDir, 'manifest.json'));
+        // Copy manifest — strip "key" field in dev builds so Chrome assigns a random ID
+        // (avoids stale storage from previous installs). Set SLICC_EXT_DEV=1 to enable.
+        const manifestSrc = resolve(__dirname, 'manifest.json');
+        const manifestDest = resolve(outDir, 'manifest.json');
+        if (process.env['SLICC_EXT_DEV']) {
+          const manifest = JSON.parse(readFileSync(manifestSrc, 'utf-8'));
+          delete manifest.key;
+          writeFileSync(manifestDest, JSON.stringify(manifest, null, 2));
+        } else {
+          copyFileSync(manifestSrc, manifestDest);
+        }
         copyFileSync(resolve(__dirname, 'sandbox.html'), resolve(outDir, 'sandbox.html'));
+        copyFileSync(resolve(__dirname, 'sprinkle-sandbox.html'), resolve(outDir, 'sprinkle-sandbox.html'));
         copyFileSync(resolve(__dirname, 'voice-popup.html'), resolve(outDir, 'voice-popup.html'));
         copyFileSync(resolve(__dirname, 'voice-popup.js'), resolve(outDir, 'voice-popup.js'));
+
+        // Copy logo files for extension icons and header
+        const logosSrc = resolve(__dirname, 'logos');
+        const logosDest = resolve(outDir, 'logos');
+        mkdirSync(logosDest, { recursive: true });
+        for (const file of readdirSync(logosSrc)) {
+          if (file.endsWith('.png') || file.endsWith('.ico')) {
+            try { copyFileSync(resolve(logosSrc, file), resolve(logosDest, file)); } catch { /* skip */ }
+          }
+        }
+
+        // Copy fonts if present (Adobe Clean — local dev only, gitignored)
+        const fontsSrc = resolve(__dirname, 'public/fonts');
+        const fontsDest = resolve(outDir, 'fonts');
+        try {
+          mkdirSync(fontsDest, { recursive: true });
+          for (const file of readdirSync(fontsSrc)) {
+            if (file.endsWith('.otf') || file.endsWith('.woff2')) {
+              try { copyFileSync(resolve(fontsSrc, file), resolve(fontsDest, file)); } catch { /* skip */ }
+            }
+          }
+        } catch { /* fonts dir doesn't exist — fine, fallback fonts will be used */ }
 
         // Bundle Pyodide for extension (both main page and sandbox CSP block CDN scripts)
         const pyodideSrc = resolve(__dirname, 'node_modules/pyodide');

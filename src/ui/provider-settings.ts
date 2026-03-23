@@ -4,21 +4,33 @@
  * provider-specific options, and dynamic model population.
  */
 
-import { getProviders, getModels, getModel } from '../core/index.js';
+import { getProviders, getModels, getModel, createLogger } from '../core/index.js';
 import type { Model } from '../core/index.js';
 import type { Api } from '@mariozechner/pi-ai';
+import { storeTrayJoinUrl, hasStoredTrayJoinUrl } from '../scoops/tray-runtime-config.js';
+import { getFollowerTrayRuntimeStatus } from '../scoops/tray-follower-status.js';
+import { getThemePreference, setThemePreference } from './theme.js';
+import type { ThemePreference } from './theme.js';
+import type { RefreshTrayRuntimeMsg } from '../extension/messages.js';
+import {
+  getRegisteredProviderConfig,
+  getRegisteredProviderIds,
+  shouldIncludeProvider,
+} from '../providers/index.js';
+import type { ProviderConfig } from '../providers/index.js';
+
+export type { ProviderConfig } from '../providers/index.js';
 
 // Dynamic wrappers — pi-ai's getModel/getModels use strict generics
 // that require KnownProvider literals, but provider-settings works
 // with runtime strings from localStorage/user selection.
-const getModelDynamic = getModel as (
-  provider: string,
-  modelId: string
-) => Model<Api>;
+const getModelDynamic = getModel as (provider: string, modelId: string) => Model<Api>;
 
-const getModelsDynamic = getModels as (
-  provider: string
-) => Model<Api>[];
+const getModelsDynamic = getModels as (provider: string) => Model<Api>[];
+
+function isExtensionRuntime(): boolean {
+  return typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
+}
 
 // Storage keys
 const ACCOUNTS_KEY = 'slicc_accounts';
@@ -40,6 +52,12 @@ export interface Account {
   providerId: string;
   apiKey: string;
   baseUrl?: string;
+  // OAuth fields (used by OAuth providers)
+  accessToken?: string;
+  refreshToken?: string;
+  tokenExpiresAt?: number;
+  userName?: string;
+  userAvatar?: string;
 }
 
 // Delete legacy keys on first access
@@ -48,7 +66,11 @@ function cleanLegacyKeys(): void {
   if (_legacyCleaned) return;
   _legacyCleaned = true;
   for (const key of LEGACY_KEYS) {
-    try { localStorage.removeItem(key); } catch { /* noop */ }
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      /* noop */
+    }
   }
 }
 
@@ -59,189 +81,164 @@ function _resetLegacyCleanup(): void {
 /** Test-only exports */
 export const __test__ = { _resetLegacyCleanup };
 
-// Provider metadata with display names and required fields
-interface ProviderConfig {
-  id: string;
-  name: string;
-  description: string;
-  requiresApiKey: boolean;
-  apiKeyPlaceholder?: string;
-  apiKeyEnvVar?: string;
-  requiresBaseUrl: boolean;
-  baseUrlPlaceholder?: string;
-  baseUrlDescription?: string;
-}
+// Provider configs are now loaded dynamically from src/providers/index.ts
+// (built-in providers in src/providers/built-in/ + external providers in /providers/)
 
-const PROVIDER_CONFIGS: Record<string, ProviderConfig> = {
-  'anthropic': {
-    id: 'anthropic',
-    name: 'Anthropic',
-    description: 'Claude models via Anthropic API',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'sk-ant-...',
-    apiKeyEnvVar: 'ANTHROPIC_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'openai': {
-    id: 'openai',
-    name: 'OpenAI',
-    description: 'GPT and Codex models',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'sk-...',
-    apiKeyEnvVar: 'OPENAI_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'openrouter': {
-    id: 'openrouter',
-    name: 'OpenRouter',
-    description: '200+ models from multiple providers',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'sk-or-...',
-    apiKeyEnvVar: 'OPENROUTER_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'groq': {
-    id: 'groq',
-    name: 'Groq',
-    description: 'Fast inference for open models',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'gsk_...',
-    apiKeyEnvVar: 'GROQ_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'google': {
-    id: 'google',
-    name: 'Google AI',
-    description: 'Gemini models via Google AI Studio',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'AI...',
-    apiKeyEnvVar: 'GOOGLE_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'google-vertex': {
-    id: 'google-vertex',
-    name: 'Google Vertex AI',
-    description: 'Gemini and Claude on Vertex',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'Access token',
-    apiKeyEnvVar: 'GOOGLE_APPLICATION_CREDENTIALS',
-    requiresBaseUrl: true,
-    baseUrlPlaceholder: 'https://us-central1-aiplatform.googleapis.com',
-    baseUrlDescription: 'Vertex AI endpoint URL',
-  },
-  'amazon-bedrock': {
-    id: 'amazon-bedrock',
-    name: 'AWS Bedrock',
-    description: 'Claude, Llama, and more on AWS',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'Session token or credentials',
-    apiKeyEnvVar: 'AWS_SESSION_TOKEN',
-    requiresBaseUrl: true,
-    baseUrlPlaceholder: 'https://bedrock-runtime.us-east-1.amazonaws.com',
-    baseUrlDescription: 'Bedrock runtime endpoint (region-specific)',
-  },
-  'bedrock-camp': {
-    id: 'bedrock-camp',
-    name: 'AWS Bedrock (CAMP)',
-    description: 'Claude on AWS Bedrock via Adobe CAMP Bearer token',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'ABSK...',
-    apiKeyEnvVar: 'BEDROCK_CAMP_API_KEY',
-    requiresBaseUrl: true,
-    baseUrlPlaceholder: 'https://bedrock-runtime.us-west-2.amazonaws.com',
-    baseUrlDescription: 'Bedrock runtime endpoint from CAMP portal',
-  },
-  'azure-ai-foundry': {
-    id: 'azure-ai-foundry',
-    name: 'Azure (Claude)',
-    description: 'Claude models via Azure AI Foundry',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'Azure API key',
-    apiKeyEnvVar: 'AZURE_API_KEY',
-    requiresBaseUrl: true,
-    baseUrlPlaceholder: 'https://your-resource.services.ai.azure.com/anthropic',
-    baseUrlDescription: 'Azure AI Foundry endpoint — must end with /anthropic',
-  },
-  'azure-openai-responses': {
-    id: 'azure-openai-responses',
-    name: 'Azure (OpenAI/GPT)',
-    description: 'GPT and Codex models on Azure OpenAI',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'Azure API key',
-    apiKeyEnvVar: 'AZURE_OPENAI_API_KEY',
-    requiresBaseUrl: true,
-    baseUrlPlaceholder: 'https://your-resource.openai.azure.com',
-    baseUrlDescription: 'Azure OpenAI endpoint URL',
-  },
-  'mistral': {
-    id: 'mistral',
-    name: 'Mistral',
-    description: 'Mistral AI models',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'Mistral API key',
-    apiKeyEnvVar: 'MISTRAL_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'xai': {
-    id: 'xai',
-    name: 'xAI',
-    description: 'Grok models',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'xAI API key',
-    apiKeyEnvVar: 'XAI_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'cerebras': {
-    id: 'cerebras',
-    name: 'Cerebras',
-    description: 'Fast inference on Cerebras hardware',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'Cerebras API key',
-    apiKeyEnvVar: 'CEREBRAS_API_KEY',
-    requiresBaseUrl: false,
-  },
-  'huggingface': {
-    id: 'huggingface',
-    name: 'HuggingFace',
-    description: 'Inference API models',
-    requiresApiKey: true,
-    apiKeyPlaceholder: 'hf_...',
-    apiKeyEnvVar: 'HF_TOKEN',
-    requiresBaseUrl: false,
-  },
-};
-
-// Get all available providers — pi-ai providers + custom providers (e.g., azure-ai-foundry)
+// Get all available providers — pi-ai providers (filtered by build config) + registered configs
 export function getAvailableProviders(): string[] {
-  const piProviders = getProviders();
-  const customProviders = Object.keys(PROVIDER_CONFIGS).filter(id => !(piProviders as string[]).includes(id));
-  return [...piProviders, ...customProviders];
+  const piProviders = (getProviders() as string[]).filter(shouldIncludeProvider);
+  const registeredIds = getRegisteredProviderIds(); // external + built-in extensions, already filtered
+  const merged = new Set([...piProviders, ...registeredIds]);
+  return [...merged];
 }
 
 // Get provider config with fallback for unknown providers
 export function getProviderConfig(providerId: string): ProviderConfig {
-  return PROVIDER_CONFIGS[providerId] || {
-    id: providerId,
-    name: providerId.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '),
-    description: `${providerId} provider`,
-    requiresApiKey: true,
-    requiresBaseUrl: false,
-  };
+  return (
+    getRegisteredProviderConfig(providerId) || {
+      id: providerId,
+      name: providerId
+        .split('-')
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' '),
+      description: `${providerId} provider`,
+      requiresApiKey: true,
+      requiresBaseUrl: false,
+    }
+  );
 }
 
 // Get models for a provider
 export function getProviderModels(providerId: string): Model<Api>[] {
   try {
-    // Azure AI Foundry uses Anthropic's Claude models
     // Bedrock CAMP uses Amazon Bedrock models with custom API
     if (providerId === 'bedrock-camp') {
       const bedrockModels = getModelsDynamic('amazon-bedrock');
-      return bedrockModels.map(m => ({ ...m, api: 'bedrock-camp-converse' as any, provider: 'bedrock-camp' }));
+      return bedrockModels.map((m) => ({
+        ...m,
+        api: 'bedrock-camp-converse' as Api,
+        provider: 'bedrock-camp',
+      }));
+    }
+    // Providers that use Anthropic's model registry with custom API
+    const providerConfig = getProviderConfig(providerId);
+    if (providerConfig.getModelIds) {
+      // Provider specifies its own model list — resolve against Anthropic registry
+      let modelIds: Array<{ id: string; name?: string }>;
+      try {
+        modelIds = providerConfig.getModelIds();
+      } catch (err) {
+        log.error('Provider getModelIds callback failed', {
+          providerId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return [];
+      }
+      const anthropicModels = getModelsDynamic('anthropic');
+      const modelMap = new Map(anthropicModels.map((m) => [m.id, m]));
+      const customApi = `${providerId}-anthropic` as Api;
+      return modelIds.map((pm) => {
+        const base = modelMap.get(pm.id);
+        if (base) return { ...base, api: customApi, provider: providerId };
+        return {
+          id: pm.id,
+          name: pm.name ?? pm.id,
+          provider: providerId,
+          api: customApi,
+          baseUrl: '',
+          contextWindow: 200000,
+          maxTokens: 16384,
+          input: ['text', 'image'],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          inputCost: 0,
+          outputCost: 0,
+          cacheReadCost: 0,
+          cacheWriteCost: 0,
+          reasoning: true,
+        } as unknown as Model<Api>;
+      });
+    }
+    if (providerConfig.isOAuth) {
+      // OAuth providers use Anthropic models with custom API routing
+      const anthropicModels = getModelsDynamic('anthropic');
+      const customApi = `${providerId}-anthropic` as Api;
+      return anthropicModels.map((m) => ({ ...m, api: customApi, provider: providerId }));
     }
     const effectiveProvider = providerId === 'azure-ai-foundry' ? 'anthropic' : providerId;
     return getModelsDynamic(effectiveProvider);
-  } catch {
+  } catch (err) {
+    log.error('Failed to load models', {
+      providerId,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return [];
+  }
+}
+
+// --- OAuth account info (used by oauth-token shell command) ---
+
+export function getOAuthAccountInfo(providerId: string): {
+  token: string;
+  expiresAt?: number;
+  userName?: string;
+  userAvatar?: string;
+  expired: boolean;
+} | null {
+  const account = getAccounts().find((a) => a.providerId === providerId);
+  if (!account?.accessToken) return null;
+  const expired = !!account.tokenExpiresAt && Date.now() > account.tokenExpiresAt - 60000;
+  return {
+    token: account.accessToken,
+    expiresAt: account.tokenExpiresAt,
+    userName: account.userName,
+    userAvatar: account.userAvatar,
+    expired,
+  };
+}
+
+// --- Build-time provider defaults from providers.json ---
+
+export interface ProviderDefault {
+  providerId: string;
+  apiKey: string;
+  baseUrl?: string;
+  model?: string;
+}
+
+// Vite resolves this at build time. Returns {} if providers.json doesn't exist.
+const providerFiles = import.meta.glob('/providers.json', {
+  eager: true,
+  import: 'default',
+}) as Record<string, ProviderDefault[]>;
+
+const providerDefaults: ProviderDefault[] = providerFiles['/providers.json'] ?? [];
+
+const log = createLogger('provider-settings');
+
+/**
+ * Auto-configure provider accounts from providers.json (bundled at build time).
+ * Only populates if no accounts exist yet — never overwrites manual config.
+ * The first entry's model becomes the selected model.
+ *
+ * Copy providers.example.json to providers.json and fill in your API keys.
+ */
+export function applyProviderDefaults(defaults: ProviderDefault[] = providerDefaults): void {
+  if (defaults.length === 0 || getAccounts().length > 0) return;
+
+  const knownProviders = new Set(getAvailableProviders());
+
+  for (const entry of defaults) {
+    if (!entry.providerId || !entry.apiKey) continue;
+    if (!knownProviders.has(entry.providerId)) {
+      log.warn(`Unknown provider "${entry.providerId}" in providers.json — skipping`);
+      continue;
+    }
+    addAccount(entry.providerId, entry.apiKey, entry.baseUrl);
+  }
+
+  const first = defaults.find((e) => e.providerId && e.apiKey && knownProviders.has(e.providerId));
+  if (first?.model && !localStorage.getItem(MODEL_KEY)) {
+    localStorage.setItem(MODEL_KEY, `${first.providerId}:${first.model}`);
   }
 }
 
@@ -287,7 +284,7 @@ export function getAccounts(): Account[] {
         entry != null &&
         typeof entry === 'object' &&
         typeof entry.providerId === 'string' &&
-        typeof entry.apiKey === 'string',
+        typeof entry.apiKey === 'string'
     );
   } catch {
     return [];
@@ -299,7 +296,7 @@ function saveAccounts(accounts: Account[]): void {
 }
 
 export function addAccount(providerId: string, apiKey: string, baseUrl?: string): void {
-  const accounts = getAccounts().filter(a => a.providerId !== providerId);
+  const accounts = getAccounts().filter((a) => a.providerId !== providerId);
   const entry: Account = { providerId, apiKey };
   if (baseUrl) entry.baseUrl = baseUrl;
   accounts.push(entry);
@@ -307,15 +304,43 @@ export function addAccount(providerId: string, apiKey: string, baseUrl?: string)
 }
 
 export function removeAccount(providerId: string): void {
-  saveAccounts(getAccounts().filter(a => a.providerId !== providerId));
+  saveAccounts(getAccounts().filter((a) => a.providerId !== providerId));
+}
+
+/** Save an OAuth account (used by external providers after token exchange). */
+export function saveOAuthAccount(opts: {
+  providerId: string;
+  accessToken: string;
+  refreshToken?: string;
+  tokenExpiresAt?: number;
+  userName?: string;
+  userAvatar?: string;
+  baseUrl?: string;
+}): void {
+  const existing = getAccounts().find((a) => a.providerId === opts.providerId);
+  const accounts = getAccounts().filter((a) => a.providerId !== opts.providerId);
+  accounts.push({
+    providerId: opts.providerId,
+    apiKey: '', // OAuth providers don't use API keys
+    accessToken: opts.accessToken,
+    refreshToken: opts.refreshToken,
+    tokenExpiresAt: opts.tokenExpiresAt,
+    userName: opts.userName,
+    userAvatar: opts.userAvatar,
+    baseUrl: opts.baseUrl ?? existing?.baseUrl,
+  });
+  saveAccounts(accounts);
 }
 
 export function getApiKeyForProvider(providerId: string): string | null {
-  return getAccounts().find(a => a.providerId === providerId)?.apiKey ?? null;
+  const account = getAccounts().find((a) => a.providerId === providerId);
+  if (!account) return null;
+  // OAuth providers use accessToken instead of apiKey
+  return account.accessToken || account.apiKey || null;
 }
 
 export function getBaseUrlForProvider(providerId: string): string | null {
-  return getAccounts().find(a => a.providerId === providerId)?.baseUrl ?? null;
+  return getAccounts().find((a) => a.providerId === providerId)?.baseUrl ?? null;
 }
 
 // --- Selected model (format: "providerId:modelId") ---
@@ -405,6 +430,39 @@ export function clearBaseUrl(): void {
   }
 }
 
+// --- Export accounts as providers.json ---
+
+/** Build a ProviderDefault[] from current accounts (pure, testable). */
+export function exportProviders(): ProviderDefault[] {
+  const accounts = getAccounts();
+  const selectedProvider = getSelectedProvider();
+  const selectedModel = getSelectedModelId();
+
+  return accounts.map((account) => {
+    const entry: ProviderDefault = {
+      providerId: account.providerId,
+      apiKey: account.apiKey,
+    };
+    if (account.baseUrl) entry.baseUrl = account.baseUrl;
+    if (account.providerId === selectedProvider && selectedModel) {
+      entry.model = selectedModel;
+    }
+    return entry;
+  });
+}
+
+/** Trigger a browser download of the current accounts as providers.json. */
+export function downloadProviders(): void {
+  const json = JSON.stringify(exportProviders(), null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'providers.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // Clear all provider settings
 export function clearAllSettings(): void {
   localStorage.removeItem(ACCOUNTS_KEY);
@@ -414,7 +472,44 @@ export function clearAllSettings(): void {
   }
 }
 
-// Resolve the current model with provider-specific baseUrl override
+/**
+ * Resolve a specific model by ID, using the current provider's
+ * baseUrl and API routing. Falls back to resolveCurrentModel() if
+ * modelId is not provided.
+ */
+export function resolveModelById(modelId?: string): Model<Api> {
+  if (!modelId) return resolveCurrentModel();
+
+  const providerId = getSelectedProvider();
+  const baseUrl = getBaseUrlForProvider(providerId);
+
+  try {
+    const providerConfig = getProviderConfig(providerId);
+    const effectiveProvider = providerConfig.isOAuth
+      ? 'anthropic'
+      : providerId === 'azure-ai-foundry'
+        ? 'anthropic'
+        : providerId === 'bedrock-camp'
+          ? 'amazon-bedrock'
+          : providerId;
+    const model = getModelDynamic(effectiveProvider, modelId);
+    if (!model?.id) throw new Error(`Model ${modelId} not found`);
+    let resolved: Model<Api> = model;
+
+    if (providerConfig.isOAuth) {
+      resolved = { ...resolved, api: `${providerId}-anthropic` as Api, provider: providerId };
+    } else if (providerId === 'bedrock-camp') {
+      resolved = { ...resolved, api: 'bedrock-camp-converse' as Api, provider: 'bedrock-camp' };
+    }
+    if (baseUrl) {
+      resolved = { ...resolved, baseUrl };
+    }
+    return resolved;
+  } catch {
+    return resolveCurrentModel();
+  }
+}
+
 export function resolveCurrentModel(): Model<Api> {
   const providerId = getSelectedProvider();
   const modelId = getSelectedModelId();
@@ -422,30 +517,43 @@ export function resolveCurrentModel(): Model<Api> {
 
   // Get default model if none selected
   const models = getProviderModels(providerId);
-  const effectiveModelId = modelId || models[0]?.id || 'claude-sonnet-4-20250514';
+  const effectiveModelId = modelId || models[0]?.id || 'claude-sonnet-4-0';
 
   try {
-    // Azure AI Foundry uses Anthropic's model registry
-    // Bedrock CAMP uses Amazon Bedrock's model registry with custom API
-    const effectiveProvider = providerId === 'azure-ai-foundry' ? 'anthropic'
-      : providerId === 'bedrock-camp' ? 'amazon-bedrock'
-      : providerId;
-    let model = getModelDynamic(effectiveProvider, effectiveModelId);
+    const providerConfig = getProviderConfig(providerId);
+    const effectiveProvider = providerConfig.isOAuth
+      ? 'anthropic'
+      : providerId === 'azure-ai-foundry'
+        ? 'anthropic'
+        : providerId === 'bedrock-camp'
+          ? 'amazon-bedrock'
+          : providerId;
+    const model = getModelDynamic(effectiveProvider, effectiveModelId);
+    if (!model?.id)
+      throw new Error(`Model ${effectiveModelId} not found in ${effectiveProvider} registry`);
+    let resolved: Model<Api> = model;
 
-    // Bedrock CAMP: override api and provider to route through custom stream function
-    if (providerId === 'bedrock-camp') {
-      model = { ...model, api: 'bedrock-camp-converse' as any, provider: 'bedrock-camp' };
+    // Override api and provider for custom routing
+    if (providerConfig.isOAuth) {
+      resolved = { ...resolved, api: `${providerId}-anthropic` as Api, provider: providerId };
+    } else if (providerId === 'bedrock-camp') {
+      resolved = { ...resolved, api: 'bedrock-camp-converse' as Api, provider: 'bedrock-camp' };
     }
 
     // Override baseUrl if custom one is set
     if (baseUrl) {
-      model = { ...model, baseUrl };
+      resolved = { ...resolved, baseUrl };
     }
 
-    return model;
+    return resolved;
   } catch {
-    // Fallback to anthropic
-    return getModelDynamic('anthropic', 'claude-sonnet-4-20250514');
+    // Model not in pi-ai registry — try provider's custom model list first
+    const customModel = models.find((m) => m.id === effectiveModelId);
+    if (customModel) {
+      return baseUrl ? { ...customModel, baseUrl } : customModel;
+    }
+    // Last resort fallback
+    return getModelDynamic('anthropic', 'claude-sonnet-4-0');
   }
 }
 
@@ -455,24 +563,63 @@ function maskApiKey(key: string): string {
   return key.slice(0, 4) + '...' + key.slice(-4);
 }
 
+/** Create an S2-style outline SVG icon (matches layout.ts pattern). */
+function svgIcon(paths: string[]): SVGSVGElement {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('viewBox', '0 0 20 20');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.5');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  for (const d of paths) {
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', d);
+    svg.appendChild(path);
+  }
+  return svg;
+}
+
+const ICON_PATHS = {
+  pen: ['M14.3 3.3a1.5 1.5 0 0 1 2.1 0l.3.3a1.5 1.5 0 0 1 0 2.1L7.7 14.8l-3.2.7.7-3.2z'],
+  trash: [
+    'M4 6h12',
+    'M8 6V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2',
+    'M6 6v10a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V6',
+  ],
+};
+
+export interface ShowProviderSettingsOptions {
+  /** When true, start with the "Join a tray" form instead of the account form (when no accounts exist). */
+  preferTrayJoin?: boolean;
+}
+
 /**
  * Show the Accounts management dialog.
- * Returns a promise that resolves when the user closes the dialog.
+ * Returns a promise that resolves to `true` if accounts were modified,
+ * `false` if the user closed without changes (so callers can skip reload).
  */
-export function showProviderSettings(): Promise<void> {
+export function showProviderSettings(options?: ShowProviderSettingsOptions): Promise<boolean> {
   return new Promise((resolve) => {
+    const accountsBefore = localStorage.getItem(ACCOUNTS_KEY) ?? '';
+
     const overlay = document.createElement('div');
     overlay.className = 'dialog-overlay';
 
     const dialog = document.createElement('div');
     dialog.className = 'dialog';
-    dialog.style.cssText = 'max-width: 480px; width: 90vw;';
+    dialog.style.cssText = 'max-width: 480px; width: 90vw; padding: 32px;';
 
-    // Decide initial view: list if accounts exist, add-form if empty
+    // Decide initial view: list if accounts exist, tray-join or add-form if empty
     if (getAccounts().length > 0) {
       renderAccountsList();
+    } else if (options?.preferTrayJoin) {
+      renderJoinTrayForm();
     } else {
-      renderAddAccountForm();
+      renderAccountForm();
     }
 
     overlay.appendChild(dialog);
@@ -489,6 +636,12 @@ export function showProviderSettings(): Promise<void> {
 
       const currentAccounts = getAccounts();
 
+      const iconBtnStyle =
+        'background: transparent; border: 1px solid var(--s2-border-subtle); ' +
+        'color: var(--s2-content-secondary); border-radius: var(--s2-radius-s); ' +
+        'padding: 6px; cursor: pointer; display: flex; align-items: center; ' +
+        'justify-content: center; transition: color 0.15s, border-color 0.15s;';
+
       if (currentAccounts.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'dialog__desc';
@@ -503,20 +656,28 @@ export function showProviderSettings(): Promise<void> {
           const row = document.createElement('div');
           row.style.cssText =
             'display: flex; align-items: center; justify-content: space-between; ' +
-            'padding: 10px 12px; background: #1a1a2e; border-radius: 6px; ' +
-            'margin-bottom: 8px; border: 1px solid #3a3a5a;';
+            'padding: 10px 12px; background: var(--s2-bg-layer-2); border-radius: var(--s2-radius-default); ' +
+            'margin-bottom: 8px; border: 1px solid var(--s2-border-subtle);';
 
           const info = document.createElement('div');
           info.style.cssText = 'flex: 1; min-width: 0;';
 
           const name = document.createElement('div');
-          name.style.cssText = 'font-size: 14px; font-weight: 600; color: #e0e0e0;';
+          name.style.cssText =
+            'font-size: 14px; font-weight: 600; color: var(--s2-content-default);';
           name.textContent = config.name;
           info.appendChild(name);
 
           const detail = document.createElement('div');
-          detail.style.cssText = 'font-size: 11px; color: #888; font-family: monospace; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;';
-          detail.textContent = maskApiKey(account.apiKey);
+          detail.style.cssText =
+            'font-size: 11px; color: var(--s2-content-disabled); font-family: monospace; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;';
+          if (account.userName) {
+            detail.textContent = account.userName;
+          } else if (account.accessToken) {
+            detail.textContent = 'Logged in';
+          } else {
+            detail.textContent = maskApiKey(account.apiKey);
+          }
           if (account.baseUrl) {
             detail.textContent += ' \u2022 ' + account.baseUrl;
           }
@@ -524,49 +685,191 @@ export function showProviderSettings(): Promise<void> {
 
           row.appendChild(info);
 
+          const actions = document.createElement('div');
+          actions.style.cssText = 'display: flex; gap: 4px; margin-left: 12px; flex-shrink: 0;';
+
+          const editBtn = document.createElement('button');
+          editBtn.style.cssText = iconBtnStyle;
+          editBtn.setAttribute('aria-label', 'Edit account');
+          editBtn.appendChild(svgIcon(ICON_PATHS.pen));
+          editBtn.addEventListener('mouseenter', () => {
+            editBtn.style.color = 'var(--s2-accent)';
+            editBtn.style.borderColor = 'var(--s2-accent)';
+          });
+          editBtn.addEventListener('mouseleave', () => {
+            editBtn.style.color = 'var(--s2-content-secondary)';
+            editBtn.style.borderColor = 'var(--s2-border-subtle)';
+          });
+          editBtn.addEventListener('click', () => {
+            renderAccountForm(account);
+          });
+          actions.appendChild(editBtn);
+
           const deleteBtn = document.createElement('button');
-          deleteBtn.style.cssText =
-            'background: transparent; border: 1px solid #633; color: #e94560; ' +
-            'border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; ' +
-            'margin-left: 12px; flex-shrink: 0;';
-          deleteBtn.textContent = 'Remove';
+          deleteBtn.style.cssText = iconBtnStyle;
+          deleteBtn.setAttribute('aria-label', 'Remove account');
+          deleteBtn.appendChild(svgIcon(ICON_PATHS.trash));
+          deleteBtn.addEventListener('mouseenter', () => {
+            deleteBtn.style.color = 'var(--s2-negative)';
+            deleteBtn.style.borderColor = 'var(--s2-negative)';
+          });
+          deleteBtn.addEventListener('mouseleave', () => {
+            deleteBtn.style.color = 'var(--s2-content-secondary)';
+            deleteBtn.style.borderColor = 'var(--s2-border-subtle)';
+          });
           deleteBtn.addEventListener('click', () => {
             removeAccount(account.providerId);
             renderAccountsList();
           });
-          row.appendChild(deleteBtn);
+          actions.appendChild(deleteBtn);
+
+          row.appendChild(actions);
 
           list.appendChild(row);
         }
         dialog.appendChild(list);
       }
 
-      // Add Account button
+      // Action buttons row
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display: flex; gap: 8px;';
+
       const addBtn = document.createElement('button');
       addBtn.className = 'dialog__btn';
+      addBtn.style.flex = '1';
       addBtn.textContent = 'Add Account';
-      addBtn.addEventListener('click', () => renderAddAccountForm());
-      dialog.appendChild(addBtn);
+      addBtn.addEventListener('click', () => renderAccountForm());
+      btnRow.appendChild(addBtn);
+
+      const exportBtn = document.createElement('button');
+      exportBtn.className = 'dialog__btn dialog__btn--secondary';
+      exportBtn.style.flex = '1';
+      exportBtn.textContent = 'Export';
+      exportBtn.addEventListener('click', () => downloadProviders());
+      btnRow.appendChild(exportBtn);
+
+      dialog.appendChild(btnRow);
+
+      // ── Tray section ────────────────────────────────────────────
+      const traySep = document.createElement('hr');
+      traySep.style.cssText =
+        'border: none; border-top: 1px solid var(--s2-border-subtle); margin: 16px 0;';
+      dialog.appendChild(traySep);
+
+      const trayLabel = document.createElement('div');
+      trayLabel.className = 'dialog__desc';
+      trayLabel.style.cssText = 'font-weight: 600; margin-bottom: 8px;';
+      trayLabel.textContent = 'Tray';
+      dialog.appendChild(trayLabel);
+
+      const followerStatus = getFollowerTrayRuntimeStatus();
+      const isFollowerActive = followerStatus.state !== 'inactive';
+      const hasJoinUrl = hasStoredTrayJoinUrl(window.localStorage);
+
+      if (isFollowerActive || hasJoinUrl) {
+        const trayStatus = document.createElement('div');
+        trayStatus.style.cssText =
+          'font-size: 12px; color: var(--s2-content-secondary); margin-bottom: 8px;';
+        const stateLabel = isFollowerActive ? followerStatus.state : 'configured';
+        trayStatus.textContent = `Follower: ${stateLabel}`;
+        if (followerStatus.error) {
+          trayStatus.textContent += ` — ${followerStatus.error}`;
+          trayStatus.style.color = 'var(--slicc-cone)';
+        }
+        dialog.appendChild(trayStatus);
+      }
+
+      const joinTrayBtn = document.createElement('button');
+      joinTrayBtn.className = 'dialog__btn dialog__btn--secondary';
+      joinTrayBtn.textContent = isFollowerActive || hasJoinUrl ? 'Rejoin tray' : 'Join a tray';
+      joinTrayBtn.addEventListener('click', () => renderJoinTrayForm());
+      dialog.appendChild(joinTrayBtn);
+
+      // ── Theme section ───────────────────────────────────────────
+      const themeSep = document.createElement('hr');
+      themeSep.style.cssText =
+        'border: none; border-top: 1px solid var(--s2-border-subtle); margin: 16px 0;';
+      dialog.appendChild(themeSep);
+
+      const themeLabel = document.createElement('div');
+      themeLabel.className = 'dialog__desc';
+      themeLabel.style.cssText = 'font-weight: 600; margin-bottom: 8px;';
+      themeLabel.textContent = 'Theme';
+      dialog.appendChild(themeLabel);
+
+      const themeGroup = document.createElement('div');
+      themeGroup.setAttribute('role', 'radiogroup');
+      themeGroup.setAttribute('aria-label', 'Theme');
+      themeGroup.style.cssText =
+        'display: flex; gap: 0; margin-bottom: 16px; ' +
+        'border-radius: var(--s2-radius-default); overflow: hidden; ' +
+        'border: 1px solid var(--s2-border-subtle);';
+
+      const themeOptions: [ThemePreference, string][] = [
+        ['system', 'System'],
+        ['light', 'Light'],
+        ['dark', 'Dark'],
+      ];
+      const themeBtns: HTMLButtonElement[] = [];
+
+      for (const [value, label] of themeOptions) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.setAttribute('role', 'radio');
+        btn.setAttribute('aria-checked', String(value === getThemePreference()));
+        btn.textContent = label;
+        btn.dataset.theme = value;
+        btn.style.cssText =
+          'flex: 1; padding: 8px 0; border: none; ' +
+          'font-size: 13px; font-weight: 600; cursor: pointer; ' +
+          'transition: background var(--s2-transition-default), ' +
+          'color var(--s2-transition-default);';
+        themeBtns.push(btn);
+        themeGroup.appendChild(btn);
+      }
+
+      function styleThemeBtns() {
+        const cs = getComputedStyle(document.documentElement);
+        for (const btn of themeBtns) {
+          const active = btn.dataset.theme === getThemePreference();
+          btn.setAttribute('aria-checked', String(active));
+          btn.style.background = active
+            ? cs.getPropertyValue('--s2-accent').trim()
+            : cs.getPropertyValue('--s2-bg-layer-2').trim();
+          btn.style.color = active ? '#fff' : cs.getPropertyValue('--s2-content-secondary').trim();
+        }
+      }
+      styleThemeBtns();
+
+      for (const btn of themeBtns) {
+        btn.addEventListener('click', () => {
+          setThemePreference(btn.dataset.theme as ThemePreference);
+          styleThemeBtns();
+        });
+      }
+
+      dialog.appendChild(themeGroup);
 
       // Close button
       const closeBtn = document.createElement('button');
-      closeBtn.className = 'dialog__btn';
-      closeBtn.style.cssText = 'margin-top: 8px; background: transparent; border: 1px solid #444;';
+      closeBtn.className = 'dialog__btn dialog__btn--secondary';
+      closeBtn.style.marginTop = '8px';
       closeBtn.textContent = 'Close';
       closeBtn.addEventListener('click', () => {
         overlay.remove();
-        resolve();
+        resolve((localStorage.getItem(ACCOUNTS_KEY) ?? '') !== accountsBefore);
       });
       dialog.appendChild(closeBtn);
     }
 
-    // ── Add account form view ───────────────────────────────────────
-    function renderAddAccountForm() {
+    // ── Account form view (add or edit) ─────────────────────────────
+    function renderAccountForm(editing?: Account) {
       dialog.innerHTML = '';
+      const isEdit = !!editing;
 
       const title = document.createElement('div');
       title.className = 'dialog__title';
-      title.textContent = 'Add Account';
+      title.textContent = isEdit ? 'Edit Account' : 'Add Account';
       dialog.appendChild(title);
 
       // Provider selector
@@ -579,30 +882,105 @@ export function showProviderSettings(): Promise<void> {
       providerSelect.className = 'dialog__input';
       providerSelect.style.marginBottom = '8px';
 
-      const providers = getAvailableProviders();
-      const existingProviders = new Set(getAccounts().map(a => a.providerId));
-
-      const sorted = [...providers].sort((a, b) => {
-        const nameA = getProviderConfig(a).name;
-        const nameB = getProviderConfig(b).name;
-        return nameA.localeCompare(nameB);
-      });
-
-      for (const providerId of sorted) {
-        if (existingProviders.has(providerId)) continue;
-        const config = getProviderConfig(providerId);
+      if (isEdit) {
+        // Locked to the existing provider
+        const config = getProviderConfig(editing.providerId);
         const opt = document.createElement('option');
-        opt.value = providerId;
+        opt.value = editing.providerId;
         opt.textContent = config.name;
         providerSelect.appendChild(opt);
+        providerSelect.disabled = true;
+        providerSelect.style.opacity = '0.7';
+      } else {
+        const providers = getAvailableProviders();
+        const existingProviders = new Set(getAccounts().map((a) => a.providerId));
+        const sorted = [...providers].sort((a, b) => {
+          const nameA = getProviderConfig(a).name;
+          const nameB = getProviderConfig(b).name;
+          return nameA.localeCompare(nameB);
+        });
+        for (const providerId of sorted) {
+          if (existingProviders.has(providerId)) continue;
+          const config = getProviderConfig(providerId);
+          const opt = document.createElement('option');
+          opt.value = providerId;
+          opt.textContent = config.name;
+          providerSelect.appendChild(opt);
+        }
       }
       dialog.appendChild(providerSelect);
 
       // Provider description
       const providerDesc = document.createElement('div');
       providerDesc.className = 'dialog__desc';
-      providerDesc.style.cssText = 'font-size: 12px; color: #888; margin-bottom: 16px; margin-top: -4px;';
+      providerDesc.style.cssText =
+        'font-size: 12px; color: var(--s2-content-tertiary); margin-bottom: 16px; margin-top: -4px;';
       dialog.appendChild(providerDesc);
+
+      // OAuth login section (shown for isOAuth providers)
+      const oauthSection = document.createElement('div');
+      oauthSection.style.cssText = 'margin-bottom: 16px; display: none;';
+
+      const oauthLoginBtn = document.createElement('button');
+      oauthLoginBtn.className = 'dialog__btn';
+      oauthLoginBtn.textContent = 'Login';
+      oauthLoginBtn.style.cssText = 'width: 100%; margin-bottom: 8px;';
+      oauthSection.appendChild(oauthLoginBtn);
+
+      const oauthStatus = document.createElement('div');
+      oauthStatus.className = 'dialog__desc';
+      oauthStatus.style.cssText =
+        'font-size: 12px; color: var(--s2-content-secondary); text-align: center;';
+      oauthSection.appendChild(oauthStatus);
+
+      // OAuth login handler — calls the provider's onOAuthLogin callback with a generic launcher
+      oauthLoginBtn.addEventListener('click', async () => {
+        const pid = providerSelect.value;
+        if (!pid) return;
+        const providerConfig = getProviderConfig(pid);
+        if (!providerConfig.onOAuthLogin) return;
+        // Validate base URL if required
+        const hadAccountBefore = getAccounts().some((a) => a.providerId === pid);
+        const existingBaseUrl = getBaseUrlForProvider(pid);
+        if (providerConfig.requiresBaseUrl && !baseUrlInput.value.trim() && !existingBaseUrl) {
+          oauthStatus.textContent = 'Base URL is required.';
+          oauthStatus.style.color = 'var(--slicc-cone)';
+          baseUrlInput.focus();
+          return;
+        }
+        // Save baseUrl before login so the provider's onOAuthLogin can read it
+        if (providerConfig.requiresBaseUrl && baseUrlInput.value.trim()) {
+          addAccount(pid, '', baseUrlInput.value.trim());
+        }
+        oauthStatus.textContent = 'Opening login window...';
+        try {
+          const { createOAuthLauncher } = await import('../providers/oauth-service.js');
+          const launcher = createOAuthLauncher();
+          await providerConfig.onOAuthLogin(launcher, renderAccountsList);
+        } catch (err) {
+          // Clean up pre-login baseUrl placeholder if no account existed before
+          if (!hadAccountBefore) {
+            try {
+              removeAccount(pid);
+            } catch {
+              /* best-effort cleanup */
+            }
+          }
+          log.error('OAuth login failed', {
+            providerId: pid,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          oauthStatus.textContent = `Login failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      });
+
+      // Show logged-in user if editing an OAuth account
+      if (isEdit && editing.userName) {
+        oauthStatus.textContent = `Logged in as ${editing.userName}`;
+        oauthLoginBtn.textContent = 'Re-login';
+      }
+
+      dialog.appendChild(oauthSection);
 
       // API Key section
       const apiKeySection = document.createElement('div');
@@ -616,6 +994,7 @@ export function showProviderSettings(): Promise<void> {
       apiKeyInput.type = 'password';
       apiKeyInput.autocomplete = 'off';
       apiKeyInput.spellcheck = false;
+      if (isEdit) apiKeyInput.value = editing.apiKey;
       apiKeySection.appendChild(apiKeyInput);
 
       dialog.appendChild(apiKeySection);
@@ -633,34 +1012,56 @@ export function showProviderSettings(): Promise<void> {
       baseUrlInput.type = 'text';
       baseUrlInput.autocomplete = 'off';
       baseUrlInput.spellcheck = false;
+      if (isEdit && editing.baseUrl) baseUrlInput.value = editing.baseUrl;
       baseUrlSection.appendChild(baseUrlInput);
 
       const baseUrlDesc = document.createElement('div');
       baseUrlDesc.className = 'dialog__desc';
-      baseUrlDesc.style.cssText = 'font-size: 11px; color: #666; margin-top: -12px; margin-bottom: 16px;';
+      baseUrlDesc.style.cssText =
+        'font-size: 11px; color: var(--s2-content-secondary); margin-top: -12px; margin-bottom: 16px;';
       baseUrlSection.appendChild(baseUrlDesc);
 
       dialog.appendChild(baseUrlSection);
 
       // Error message area
       const errorEl = document.createElement('div');
-      errorEl.style.cssText = 'color: #e94560; font-size: 12px; margin-bottom: 8px; display: none;';
+      errorEl.style.cssText =
+        'color: var(--slicc-cone); font-size: 12px; margin-bottom: 8px; display: none;';
       dialog.appendChild(errorEl);
+
+      // Save button (created before updateFormFields so it can be toggled)
+      const saveBtn = document.createElement('button');
+      saveBtn.className = 'dialog__btn';
+      saveBtn.textContent = isEdit ? 'Save' : 'Add';
 
       function updateFormFields() {
         const pid = providerSelect.value;
         if (!pid) return;
-        const config = getProviderConfig(pid);
+        const providerConfig = getProviderConfig(pid);
 
-        providerDesc.textContent = config.description;
+        providerDesc.textContent = providerConfig.description;
 
-        apiKeyLabel.textContent = `API Key${config.apiKeyEnvVar ? ` (${config.apiKeyEnvVar})` : ''}:`;
-        apiKeyInput.placeholder = config.apiKeyPlaceholder || 'API key';
-        apiKeySection.style.display = config.requiresApiKey ? '' : 'none';
-
-        baseUrlInput.placeholder = config.baseUrlPlaceholder || 'https://...';
-        baseUrlDesc.textContent = config.baseUrlDescription || '';
-        baseUrlSection.style.display = config.requiresBaseUrl ? '' : 'none';
+        // OAuth providers show login button instead of API key input
+        if (providerConfig.isOAuth) {
+          oauthSection.style.display = '';
+          apiKeySection.style.display = 'none';
+          baseUrlSection.style.display = providerConfig.requiresBaseUrl ? '' : 'none';
+          if (providerConfig.requiresBaseUrl) {
+            baseUrlInput.placeholder = providerConfig.baseUrlPlaceholder || 'https://...';
+            baseUrlDesc.textContent = providerConfig.baseUrlDescription || '';
+          }
+          oauthLoginBtn.textContent = `Login with ${providerConfig.name}`;
+          saveBtn.style.display = 'none';
+        } else {
+          oauthSection.style.display = 'none';
+          apiKeyLabel.textContent = `API Key${providerConfig.apiKeyEnvVar ? ` (${providerConfig.apiKeyEnvVar})` : ''}:`;
+          apiKeyInput.placeholder = providerConfig.apiKeyPlaceholder || 'API key';
+          apiKeySection.style.display = providerConfig.requiresApiKey ? '' : 'none';
+          baseUrlInput.placeholder = providerConfig.baseUrlPlaceholder || 'https://...';
+          baseUrlDesc.textContent = providerConfig.baseUrlDescription || '';
+          baseUrlSection.style.display = providerConfig.requiresBaseUrl ? '' : 'none';
+          saveBtn.style.display = '';
+        }
       }
 
       providerSelect.addEventListener('change', () => {
@@ -669,12 +1070,7 @@ export function showProviderSettings(): Promise<void> {
       });
       updateFormFields();
 
-      // Add button
-      const saveBtn = document.createElement('button');
-      saveBtn.className = 'dialog__btn';
-      saveBtn.textContent = 'Add';
-
-      function validateAndAdd() {
+      function validateAndSave() {
         const pid = providerSelect.value;
         if (!pid) return;
         const config = getProviderConfig(pid);
@@ -693,19 +1089,15 @@ export function showProviderSettings(): Promise<void> {
           return;
         }
 
-        addAccount(
-          pid,
-          apiKeyInput.value.trim(),
-          config.requiresBaseUrl ? baseUrlInput.value.trim() : undefined,
-        );
+        addAccount(pid, apiKeyInput.value.trim(), baseUrlInput.value.trim() || undefined);
 
         renderAccountsList();
       }
 
-      saveBtn.addEventListener('click', validateAndAdd);
+      saveBtn.addEventListener('click', validateAndSave);
 
       const handleEnter = (e: KeyboardEvent) => {
-        if (e.key === 'Enter') validateAndAdd();
+        if (e.key === 'Enter') validateAndSave();
       };
       apiKeyInput.addEventListener('keydown', handleEnter);
       baseUrlInput.addEventListener('keydown', handleEnter);
@@ -714,10 +1106,19 @@ export function showProviderSettings(): Promise<void> {
 
       // Back button (only shown when accounts already exist)
       const hasAccounts = getAccounts().length > 0;
-      if (hasAccounts) {
+      if (!isEdit && !hasAccounts) {
+        const joinBtn = document.createElement('button');
+        joinBtn.className = 'dialog__btn dialog__btn--secondary';
+        joinBtn.style.marginTop = '8px';
+        joinBtn.textContent = 'Join a tray';
+        joinBtn.addEventListener('click', () => {
+          renderJoinTrayForm();
+        });
+        dialog.appendChild(joinBtn);
+      } else if (hasAccounts) {
         const backBtn = document.createElement('button');
-        backBtn.className = 'dialog__btn';
-        backBtn.style.cssText = 'margin-top: 8px; background: transparent; border: 1px solid #444;';
+        backBtn.className = 'dialog__btn dialog__btn--secondary';
+        backBtn.style.marginTop = '8px';
         backBtn.textContent = 'Back';
         backBtn.addEventListener('click', () => {
           renderAccountsList();
@@ -735,6 +1136,102 @@ export function showProviderSettings(): Promise<void> {
           baseUrlInput.focus();
         }
       });
+    }
+
+    function renderJoinTrayForm() {
+      dialog.innerHTML = '';
+
+      const title = document.createElement('div');
+      title.className = 'dialog__title';
+      title.textContent = 'Join a tray';
+      dialog.appendChild(title);
+
+      const desc = document.createElement('div');
+      desc.className = 'dialog__desc';
+      desc.style.marginBottom = '12px';
+      desc.textContent =
+        'Paste the tray join URL shared by the tray leader. It must include a /join/... capability.';
+      dialog.appendChild(desc);
+
+      const trayUrlLabel = document.createElement('div');
+      trayUrlLabel.className = 'dialog__desc';
+      trayUrlLabel.textContent = 'Tray URL:';
+      dialog.appendChild(trayUrlLabel);
+
+      const trayUrlInput = document.createElement('input');
+      trayUrlInput.className = 'dialog__input';
+      trayUrlInput.type = 'text';
+      trayUrlInput.autocomplete = 'off';
+      trayUrlInput.spellcheck = false;
+      trayUrlInput.placeholder = 'https://tray.example.com/base/join/tray-123.capability-token';
+      trayUrlInput.style.marginBottom = '12px';
+      dialog.appendChild(trayUrlInput);
+
+      const errorEl = document.createElement('div');
+      errorEl.style.cssText =
+        'color: var(--slicc-cone); font-size: 12px; margin-bottom: 8px; display: none;';
+      dialog.appendChild(errorEl);
+
+      const statusEl = document.createElement('div');
+      statusEl.style.cssText =
+        'font-size: 12px; color: var(--s2-content-secondary); margin-bottom: 8px; display: none;';
+
+      const joinBtn = document.createElement('button');
+      joinBtn.className = 'dialog__btn';
+      joinBtn.textContent = 'Join tray';
+      joinBtn.addEventListener('click', () => {
+        const stored = storeTrayJoinUrl(window.localStorage, trayUrlInput.value);
+        if (!stored) {
+          errorEl.textContent = 'Enter a valid tray join URL with a /join/... capability.';
+          errorEl.style.display = '';
+          trayUrlInput.focus();
+          return;
+        }
+
+        if (isExtensionRuntime()) {
+          const payload: RefreshTrayRuntimeMsg = { type: 'refresh-tray-runtime' };
+          void chrome.runtime.sendMessage({ source: 'panel' as const, payload }).catch(() => {
+            // Offscreen may not be ready yet; mainExtension will reconnect shortly.
+          });
+        } else {
+          // Trigger follower join in standalone mode without page reload
+          window.dispatchEvent(
+            new CustomEvent('slicc:tray-join', {
+              detail: { joinUrl: stored.joinUrl },
+            })
+          );
+        }
+
+        statusEl.textContent = 'Connecting to tray...';
+        statusEl.style.display = '';
+        statusEl.style.color = 'var(--s2-content-secondary)';
+
+        // Close dialog after brief feedback
+        setTimeout(() => {
+          overlay.remove();
+          resolve(false);
+        }, 800);
+      });
+      dialog.appendChild(joinBtn);
+      dialog.appendChild(statusEl);
+
+      const backBtn = document.createElement('button');
+      backBtn.className = 'dialog__btn dialog__btn--secondary';
+      backBtn.style.marginTop = '8px';
+      backBtn.textContent = 'Back';
+      backBtn.addEventListener('click', () => {
+        renderAccountForm();
+      });
+      dialog.appendChild(backBtn);
+
+      trayUrlInput.addEventListener('input', () => {
+        errorEl.style.display = 'none';
+      });
+      trayUrlInput.addEventListener('keydown', (e: KeyboardEvent) => {
+        if (e.key === 'Enter') joinBtn.click();
+      });
+
+      requestAnimationFrame(() => trayUrlInput.focus());
     }
   });
 }

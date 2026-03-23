@@ -78,7 +78,8 @@ export class MemoryPanel {
               ? '/workspace/CLAUDE.md'
               : `/scoops/${scoop.folder}/CLAUDE.md`;
             const content = await fs.readFile(memoryPath, { encoding: 'utf-8' });
-            scoopContent.textContent = typeof content === 'string' ? content : new TextDecoder().decode(content);
+            scoopContent.textContent =
+              typeof content === 'string' ? content : new TextDecoder().decode(content);
           } else {
             scoopContent.textContent = '(filesystem not ready)';
           }
@@ -100,11 +101,6 @@ export class MemoryPanel {
   private render(): void {
     while (this.container.firstChild) this.container.removeChild(this.container.firstChild);
     this.container.classList.add('memory-panel');
-
-    const header = document.createElement('div');
-    header.className = 'panel-header';
-    header.textContent = 'Memory';
-    this.container.appendChild(header);
 
     this.bodyEl = document.createElement('div');
     this.bodyEl.className = 'memory-panel__body';

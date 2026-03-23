@@ -1,6 +1,7 @@
 import { loadPyodide } from 'pyodide';
 import type { PyodideInterface } from 'pyodide';
 import { getMimeType } from '../../core/mime-types.js';
+import { normalizePath } from '../../fs/path-utils.js';
 
 export interface SqlJsResultSet {
   columns: string[];
@@ -91,7 +92,9 @@ export function ensureWithinRoot(root: string, path: string): boolean {
 }
 
 function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 export function formatSqlValue(value: unknown): string {
@@ -102,6 +105,27 @@ export function formatSqlValue(value: unknown): string {
 
 export function detectMimeType(path: string): string {
   return getMimeType(path);
+}
+
+export function toPreviewUrl(vfsPath: string): string {
+  const isExt = typeof chrome !== 'undefined' && !!chrome?.runtime?.id;
+  const previewPath = `/preview${vfsPath}`;
+  if (isExt) return chrome.runtime.getURL(previewPath);
+  // Use current origin when in browser, fall back to default port for tests/Node
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'http://localhost:5710';
+  return `${origin}${previewPath}`;
+}
+
+export function isSafeServeEntry(entry: string): boolean {
+  if (entry.length === 0 || entry.startsWith('/')) return false;
+  return !entry.split('/').some((segment) => segment === '..');
+}
+
+export function resolveServeEntryPath(directory: string, entry: string): string {
+  return normalizePath(`${directory}/${entry}`);
 }
 
 export function formatConsoleArg(value: unknown): string {
@@ -119,9 +143,10 @@ export async function getSqlJs(): Promise<SqlJsModule> {
     sqlJsPromise = (async () => {
       const sqlModule = await import('sql.js/dist/sql-wasm.js');
       const initSqlJs = (sqlModule as { default: InitSqlJs }).default;
-      const wasmBase = typeof window === 'undefined'
-        ? new URL('../../../node_modules/sql.js/dist/', import.meta.url).toString()
-        : SQLJS_WASM_CDN;
+      const wasmBase =
+        typeof window === 'undefined'
+          ? new URL('../../../node_modules/sql.js/dist/', import.meta.url).toString()
+          : SQLJS_WASM_CDN;
       return initSqlJs({ locateFile: (file) => `${wasmBase}${file}` });
     })();
   }
@@ -135,7 +160,9 @@ export async function getPyodide(): Promise<PyodideInterface> {
     pyodidePromise = (async () => {
       let indexURL: string;
       if (typeof window === 'undefined') {
-        indexURL = decodeURIComponent(new URL('../../../node_modules/pyodide/', import.meta.url).pathname);
+        indexURL = decodeURIComponent(
+          new URL('../../../node_modules/pyodide/', import.meta.url).pathname
+        );
       } else if (isExtension) {
         indexURL = chrome.runtime.getURL('pyodide/');
       } else {
