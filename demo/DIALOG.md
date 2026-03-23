@@ -66,17 +66,17 @@ Hmm, what's going on in my Slack channels? Anything I should actually care about
 **SLICC:**
 OK let me take a look. [pause]
 
-Right, so — you've got three mentions in dev. Sarah's asking about the deploy timeline, that seems kinda urgent. There's a thread in design about the new landing page, mostly back and forth still. And someone dropped a PR in code-review that touches your module.
+Right, so — you've got a couple mentions in ai-ecoverse. Cedric's asking for a keyboard shortcut to toggle the overlay, plus he wants Sonnet added as a model option — says Opus is overkill for everyday stuff.
 
 Want me to jump on any of these?
 
 **USER:**
-Yeah — reply to Sarah. Tell her we're on track, shipping the fix this afternoon.
+Yeah — reply to Cedric. Tell him we'll add the shortcut and look into the Sonnet option.
 
-*[SLICC navigates Slack, finds Sarah's message, types the reply.]*
+*[SLICC navigates Slack, finds Cedric's message, types the reply.]*
 
 **SLICC:**
-Done. Replied to Sarah in dev. [beat] She'll see it.
+Done. Replied to Cedric in ai-ecoverse. [beat] He'll see it.
 
 ---
 
@@ -86,6 +86,9 @@ Done. Replied to Sarah in dev. [beat] She'll see it.
 
 **SLICC:**
 So yeah — three apps, one session, one agent. [beat] Need anything else, or are we good?
+
+**USER:**
+That's amazing. Looks like SLICC can really simplify my... life!
 
 *[Fade to branded slide.]*
 
